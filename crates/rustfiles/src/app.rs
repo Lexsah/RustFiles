@@ -150,6 +150,7 @@ pub struct RustFilesApp {
     icon_order: VecDeque<PathBuf>,
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
+    pub system_accent: Option<egui::Color32>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub mica_armed: bool,
     perf_path: Option<PathBuf>,
@@ -277,6 +278,8 @@ impl RustFilesApp {
             icon_order: VecDeque::new(),
             icon_tx,
             mica_applied: false,
+            system_accent: platform::system_accent()
+                .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
             mica_armed: false,
             perf_path: std::env::var("RUSTFILES_PERF").ok().map(PathBuf::from),
             perf_started: Instant::now(),
@@ -713,6 +716,18 @@ impl RustFilesApp {
             Action::Escape => self.escape(),
             Action::Open => self.open_selection(),
         }
+    }
+
+    pub fn pin_folder(&mut self, path: PathBuf) {
+        if path.as_os_str().is_empty() || !path.is_dir() {
+            return;
+        }
+        if self.favorites.iter().any(|have| have == &path) {
+            return;
+        }
+        self.favorites.push(path);
+        self.save_config();
+        self.status = self.tr.pin.into();
     }
 
     pub fn navigate(&mut self, path: PathBuf) {

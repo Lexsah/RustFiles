@@ -3,7 +3,7 @@
 ; from the repository root after `cargo build --release`.
 
 #define MyAppName "RustFiles"
-#define MyAppVersion "0.3.6"
+#define MyAppVersion "0.3.7"
 #define MyAppPublisher "Lexsah"
 #define MyAppExeName "rustfiles.exe"
 
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\RustFiles
 DefaultGroupName=RustFiles
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=RustFiles-0.3.6-Setup
+OutputBaseFilename=RustFiles-0.3.7-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

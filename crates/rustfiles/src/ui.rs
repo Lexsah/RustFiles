@@ -33,7 +33,11 @@ impl RustFilesApp {
             visuals.panel_fill = Color32::TRANSPARENT;
             ui.ctx().set_visuals(visuals);
         }
-        let palette = theme::palette(self.dark);
+        let mut palette = theme::palette(self.dark);
+        if let Some(accent) = self.system_accent {
+            palette.accent = accent;
+            palette.usage = accent;
+        }
         let full = ui.max_rect();
         let backdrop = if self.mica_applied {
             Color32::TRANSPARENT
@@ -78,14 +82,11 @@ impl RustFilesApp {
         } else {
             palette.sidebar
         };
-        let file_fill = if self.mica_applied {
-            if self.dark {
-                Color32::from_rgba_unmultiplied(44, 44, 44, 220)
-            } else {
-                Color32::from_rgba_unmultiplied(252, 252, 252, 230)
-            }
+        // The file area is a separate, nearly opaque card over the Mica chrome.
+        let file_fill = if self.dark {
+            Color32::from_rgba_unmultiplied(44, 44, 44, 248)
         } else {
-            palette.file_area
+            Color32::from_rgba_unmultiplied(252, 252, 252, 248)
         };
         let file_radius = CornerRadius {
             nw: 12,
@@ -96,6 +97,19 @@ impl RustFilesApp {
         ui.painter()
             .rect_filled(side, CornerRadius::ZERO, side_fill);
         ui.painter().rect_filled(content, file_radius, file_fill);
+        ui.painter().rect_stroke(
+            content,
+            file_radius,
+            Stroke::new(
+                1.0,
+                if self.dark {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                } else {
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 16)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
         if preview_w > 0.0 {
             ui.painter()
                 .rect_filled(preview, CornerRadius::ZERO, palette.sidebar);
@@ -220,13 +234,19 @@ impl RustFilesApp {
             let hover = ui
                 .ctx()
                 .animate_bool_with_time(response.id, response.hovered(), 0.1);
-            if hover > 0.01 {
-                let fill = if close {
-                    Color32::from_rgb(196, 43, 28).gamma_multiply(hover)
-                } else {
-                    palette.hover.gamma_multiply(hover)
-                };
-                ui.painter().rect_filled(button, CornerRadius::ZERO, fill);
+            // Close stays fully transparent until the pointer is actually on it.
+            if close && response.hovered() {
+                ui.painter().rect_filled(
+                    button,
+                    CornerRadius::ZERO,
+                    Color32::from_rgb(196, 43, 28),
+                );
+            } else if !close && hover > 0.01 {
+                ui.painter().rect_filled(
+                    button,
+                    CornerRadius::ZERO,
+                    palette.hover.gamma_multiply(hover),
+                );
             }
             if response.clicked() {
                 let cmd = match *id {
@@ -294,7 +314,7 @@ impl RustFilesApp {
         let search_w = 240.0;
         let address_w = (bar.available_width() - search_w - 16.0).max(180.0);
         let (address, address_response) =
-            bar.allocate_exact_size(Vec2::new(address_w, 32.0), Sense::click());
+            bar.allocate_exact_size(Vec2::new(address_w, 28.0), Sense::click());
         bar.painter().rect(
             address,
             CornerRadius::same(4),
@@ -325,7 +345,15 @@ impl RustFilesApp {
                     .max_rect(address.shrink2(Vec2::new(10.0, 0.0)))
                     .layout(Layout::left_to_right(Align::Center)),
             );
-            if crumb_chip(&mut crumbs, Some(icons::HOME), self.tr.home, palette).clicked() {
+            if crumb_chip(
+                &mut crumbs,
+                Some(icons::HOME),
+                self.tr.home,
+                palette,
+                palette.accent,
+            )
+            .clicked()
+            {
                 self.show_home();
             }
             if !self.tab().home {
@@ -347,7 +375,7 @@ impl RustFilesApp {
                         }
                     });
                     let shown = drive_crumb(self, label, path);
-                    if crumb_chip(&mut crumbs, None, &shown, palette).clicked() {
+                    if crumb_chip(&mut crumbs, None, &shown, palette, palette.text).clicked() {
                         self.navigate(path.clone());
                         return;
                     }
@@ -402,7 +430,14 @@ impl RustFilesApp {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         bar.add_space(8.0);
-        let new_button = command_button(&mut bar, icons::ADD, self.tr.new, palette);
+        let new_button = command_button_ex(
+            &mut bar,
+            icons::ADD,
+            self.tr.new,
+            palette,
+            true,
+            palette.accent,
+        );
         if new_button.clicked() {
             self.new_menu = !self.new_menu;
         }
@@ -426,15 +461,38 @@ impl RustFilesApp {
                 self.perform(action);
             }
         }
+        // Files hides the right-cluster labels below a 750px window.
+        let wide_commands = rect.width() >= 750.0;
         let layout_button = bar.with_layout(Layout::right_to_left(Align::Center), |bar| {
-            bar.add_space(8.0);
+            bar.add_space(4.0);
             if icon_button(bar, icons::DOCUMENT, self.tr.preview, palette, true).clicked() {
                 self.show_preview = !self.show_preview;
                 self.save_config();
             }
-            let layout_button = command_button(bar, icons::GRID, self.tr.layout, palette);
-            let group_button = command_button(bar, icons::LIST, self.tr.group, palette);
-            let sort_button = command_button(bar, icons::SORT, self.tr.sort, palette);
+            let layout_button = command_button_ex(
+                bar,
+                icons::GRID,
+                self.tr.layout,
+                palette,
+                wide_commands,
+                palette.text,
+            );
+            let group_button = command_button_ex(
+                bar,
+                icons::LIST,
+                self.tr.group,
+                palette,
+                wide_commands,
+                palette.text,
+            );
+            let sort_button = command_button_ex(
+                bar,
+                icons::SORT,
+                self.tr.sort,
+                palette,
+                wide_commands,
+                palette.text,
+            );
             if icon_button(bar, icons::INFO, self.tr.analyze, palette, true).clicked() {
                 self.perform(Action::Analyzer);
             }
@@ -566,17 +624,10 @@ impl RustFilesApp {
                     palette,
                 ) {
                     for (glyph, label, path) in favorites {
-                        if nav_entry(side, self, Some(&path), glyph, label, palette).clicked() {
+                        if nav_entry(side, self, Some(&path), glyph, label, false, palette)
+                            .clicked()
+                        {
                             self.navigate(path);
-                        }
-                    }
-                    if nav_row(side, icons::PIN, self.tr.pin, false, palette).clicked()
-                        && !self.tab().home
-                    {
-                        let path = self.tab().path.clone();
-                        if !self.favorites.iter().any(|have| have == &path) {
-                            self.favorites.push(path);
-                            self.save_config();
                         }
                     }
                     for path in self.favorites.clone() {
@@ -587,7 +638,8 @@ impl RustFilesApp {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| path.display().to_string());
-                        if nav_entry(side, self, Some(&path), icons::STAR, &name, palette).clicked()
+                        if nav_entry(side, self, Some(&path), icons::STAR, &name, false, palette)
+                            .clicked()
                         {
                             self.navigate(path);
                         }
@@ -604,8 +656,16 @@ impl RustFilesApp {
                     for volume in self.volumes.clone() {
                         let label = drive_title(&volume.label, &volume.mount, self.lang);
                         let mount = PathBuf::from(&volume.mount);
-                        if nav_entry(side, self, Some(&mount), icons::HARD_DRIVE, &label, palette)
-                            .clicked()
+                        if nav_entry(
+                            side,
+                            self,
+                            Some(&mount),
+                            icons::HARD_DRIVE,
+                            &label,
+                            true,
+                            palette,
+                        )
+                        .clicked()
                         {
                             self.navigate(mount);
                         }
@@ -1658,12 +1718,18 @@ impl RustFilesApp {
         }
         let status = localize_status(&self.tr, &self.status);
         if !status.is_empty() {
+            let indexing = self.status.starts_with("indexing");
+            let color = if indexing {
+                palette.text_secondary.gamma_multiply(0.55)
+            } else {
+                palette.text_secondary
+            };
             ui.painter().text(
                 pos2(rect.right() - 12.0, y),
                 egui::Align2::RIGHT_CENTER,
                 truncate(&status, 72),
                 FontId::proportional(12.0),
-                palette.text_secondary,
+                color,
             );
         }
     }
@@ -1769,17 +1835,30 @@ impl RustFilesApp {
     }
 
     fn paint_context_menu(&mut self, ui: &mut Ui, pos: egui::Pos2, path: PathBuf) {
-        let palette = theme::palette(self.dark);
-        let rows = [
-            (self.tr.open, Action::Open),
-            (self.tr.copy, Action::Copy),
-            (self.tr.cut, Action::Cut),
-            (self.tr.paste, Action::Paste),
-            (self.tr.rename, Action::Rename),
-            (self.tr.delete, Action::Trash),
-            (self.tr.delete_permanently, Action::DeletePermanent),
-            (self.tr.properties, Action::TogglePreview),
+        let mut palette = theme::palette(self.dark);
+        if let Some(accent) = self.system_accent {
+            palette.accent = accent;
+        }
+        enum Item {
+            Act(Action),
+            Pin,
+        }
+        let mut rows = vec![
+            (self.tr.open, Item::Act(Action::Open)),
+            (self.tr.copy, Item::Act(Action::Copy)),
+            (self.tr.cut, Item::Act(Action::Cut)),
+            (self.tr.paste, Item::Act(Action::Paste)),
+            (self.tr.rename, Item::Act(Action::Rename)),
+            (self.tr.delete, Item::Act(Action::Trash)),
+            (
+                self.tr.delete_permanently,
+                Item::Act(Action::DeletePermanent),
+            ),
+            (self.tr.properties, Item::Act(Action::TogglePreview)),
         ];
+        if path.is_dir() {
+            rows.insert(1, (self.tr.pin, Item::Pin));
+        }
         let width = 240.0;
         let height = 8.0 + rows.len() as f32 * 34.0;
         let rect = Rect::from_min_size(pos, Vec2::new(width, height));
@@ -1811,6 +1890,14 @@ impl RustFilesApp {
             if self.pane != Pane::Analyzer {
                 self.tab_mut().selected = vec![path.clone()];
             }
+            let action = match action {
+                Item::Pin => {
+                    self.pin_folder(path);
+                    self.context_menu = None;
+                    return;
+                }
+                Item::Act(action) => action,
+            };
             if action == Action::TogglePreview {
                 self.show_preview = true;
                 let _ = self.commands.send(Command::Preview { path });
@@ -2207,28 +2294,54 @@ fn nav_button(ui: &mut Ui, glyph: u32, enabled: bool, palette: FilesPalette) -> 
     response
 }
 fn command_button(ui: &mut Ui, glyph: u32, label: &str, palette: FilesPalette) -> egui::Response {
-    let width = 44.0 + label.chars().count() as f32 * 8.2;
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    command_button_ex(ui, glyph, label, palette, true, palette.text)
+}
+
+fn command_button_ex(
+    ui: &mut Ui,
+    glyph: u32,
+    label: &str,
+    palette: FilesPalette,
+    show_label: bool,
+    glyph_color: Color32,
+) -> egui::Response {
+    let text_w = label.chars().count() as f32 * 7.2;
+    let width = if show_label {
+        8.0 + 16.0 + 6.0 + text_w + 8.0
+    } else {
+        32.0
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 32.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), palette.hover);
     }
+    let icon_x = if show_label {
+        8.0
+    } else {
+        rect.width() / 2.0 - 8.0
+    };
     ui.painter().text(
-        rect.left_center() + Vec2::new(6.0, 0.0),
+        rect.left_center() + Vec2::new(icon_x, 0.0),
         egui::Align2::LEFT_CENTER,
         icons::glyph(glyph),
         icon_font(16.0),
-        palette.text,
+        glyph_color,
     );
-    ui.painter().text(
-        rect.left_center() + Vec2::new(26.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(13.0),
-        palette.text,
-    );
-    ui.add_space(2.0);
-    response
+    if show_label {
+        ui.painter().text(
+            rect.left_center() + Vec2::new(icon_x + 20.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(14.0),
+            palette.text,
+        );
+    }
+    if show_label {
+        response
+    } else {
+        response.on_hover_text(label)
+    }
 }
 #[allow(dead_code)]
 fn text_button(ui: &mut Ui, label: &str, palette: FilesPalette) -> egui::Response {
@@ -2284,7 +2397,6 @@ fn icon_button(
         icon_font(16.0),
         color,
     );
-    ui.add_space(2.0);
     response.on_hover_text(tip)
 }
 
@@ -2298,7 +2410,7 @@ fn bar_separator(ui: &mut Ui, palette: FilesPalette) {
 }
 
 fn crumb_chevron(ui: &mut Ui, palette: FilesPalette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(16.0, 28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(12.0, 22.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), palette.hover);
@@ -2307,7 +2419,7 @@ fn crumb_chevron(ui: &mut Ui, palette: FilesPalette) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icons::glyph(icons::CHEVRON_RIGHT),
-        icon_font(12.0),
+        icon_font(10.0),
         palette.text_secondary,
     );
     response
@@ -2352,24 +2464,24 @@ fn crumb_chip(
     glyph: Option<u32>,
     label: &str,
     palette: FilesPalette,
+    glyph_color: Color32,
 ) -> egui::Response {
-    let width =
-        16.0 + label.chars().count() as f32 * 7.6 + if glyph.is_some() { 22.0 } else { 0.0 };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width.max(28.0), 28.0), Sense::click());
+    let width = 8.0 + label.chars().count() as f32 * 7.2 + if glyph.is_some() { 18.0 } else { 0.0 };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width.max(24.0), 22.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), palette.hover);
     }
-    let mut x = rect.left() + 6.0;
+    let mut x = rect.left() + 4.0;
     if let Some(glyph) = glyph {
         ui.painter().text(
-            pos2(x + 8.0, rect.center().y),
+            pos2(x + 7.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
             icons::glyph(glyph),
-            icon_font(16.0),
-            palette.text,
+            icon_font(14.0),
+            glyph_color,
         );
-        x += 20.0;
+        x += 16.0;
     }
     ui.painter().text(
         pos2(x, rect.center().y),
@@ -2378,7 +2490,6 @@ fn crumb_chip(
         FontId::proportional(14.0),
         palette.text,
     );
-    ui.add_space(2.0);
     response
 }
 
@@ -2430,6 +2541,7 @@ fn nav_entry(
     path: Option<&std::path::Path>,
     glyph: u32,
     label: &str,
+    leading_chevron: bool,
     palette: FilesPalette,
 ) -> egui::Response {
     let selected = path.is_some_and(|path| !app.tab().home && app.tab().path == path);
@@ -2438,27 +2550,20 @@ fn nav_entry(
         app.request_icon(path, 32);
     }
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(4),
-        if selected {
-            palette.selected
-        } else if response.hovered() {
-            palette.hover
-        } else {
-            Color32::TRANSPARENT
-        },
-    );
-    if selected {
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.left_top(), Vec2::new(3.0, rect.height())),
-            CornerRadius::ZERO,
-            palette.accent,
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
+    paint_nav_pill(ui, rect, selected, response.hovered(), palette);
+    let y = rect.center().y;
+    if leading_chevron {
+        ui.painter().text(
+            pos2(rect.left() + 14.0, y),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(icons::CHEVRON_RIGHT),
+            icon_font(10.0),
+            palette.text_secondary,
         );
     }
-    let icon_rect =
-        Rect::from_center_size(rect.left_center() + Vec2::new(18.0, 0.0), Vec2::splat(20.0));
+    let icon_x = if leading_chevron { 36.0 } else { 28.0 };
+    let icon_rect = Rect::from_center_size(pos2(rect.left() + icon_x, y), Vec2::splat(20.0));
     if let Some(texture) = texture {
         ui.painter().image(
             texture.id(),
@@ -2471,25 +2576,39 @@ fn nav_entry(
             icon_rect.center(),
             egui::Align2::CENTER_CENTER,
             icons::glyph(glyph),
-            icon_font(18.0),
+            icon_font(16.0),
             palette.text,
         );
     }
     ui.painter().text(
-        pos2(icon_rect.right() + 12.0, rect.center().y),
+        pos2(icon_rect.right() + 10.0, y),
         egui::Align2::LEFT_CENTER,
-        truncate(label, 28),
+        truncate(label, 26),
         FontId::proportional(14.0),
         palette.text,
     );
-    if glyph == icons::HARD_DRIVE {
-        ui.painter().text(
-            rect.right_center() - Vec2::new(14.0, 0.0),
-            egui::Align2::RIGHT_CENTER,
-            icons::glyph(icons::CHEVRON_RIGHT),
-            icon_font(12.0),
-            palette.text_secondary,
-        );
+    if response.hovered() {
+        if let Some(path) = path {
+            let pin = Rect::from_center_size(
+                rect.right_center() - Vec2::new(16.0, 0.0),
+                Vec2::splat(24.0),
+            );
+            let pin_response = ui.interact(pin, response.id.with("pin"), Sense::click());
+            if pin_response.hovered() {
+                ui.painter()
+                    .rect_filled(pin, CornerRadius::same(4), palette.hover);
+            }
+            ui.painter().text(
+                pin.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::glyph(icons::PIN),
+                icon_font(14.0),
+                palette.text_secondary,
+            );
+            if pin_response.clicked() {
+                app.pin_folder(path.to_path_buf());
+            }
+        }
     }
     response
 }
@@ -2509,6 +2628,34 @@ fn section_title(ui: &mut Ui, title: &str, palette: FilesPalette) {
     );
     ui.add_space(2.0);
 }
+fn paint_nav_pill(ui: &Ui, rect: Rect, selected: bool, hovered: bool, palette: FilesPalette) {
+    let pill = rect.shrink2(Vec2::new(4.0, 2.0));
+    let dark = palette.text.r() > 200;
+    let alpha = if selected {
+        20
+    } else if hovered {
+        12
+    } else {
+        0
+    };
+    if alpha > 0 {
+        let fill = if dark {
+            Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+        } else {
+            Color32::from_rgba_unmultiplied(0, 0, 0, alpha)
+        };
+        ui.painter().rect_filled(pill, CornerRadius::same(4), fill);
+    }
+    if selected {
+        let bar = Rect::from_center_size(
+            pos2(pill.left() + 2.0, pill.center().y),
+            Vec2::new(3.0, 16.0),
+        );
+        ui.painter()
+            .rect_filled(bar, CornerRadius::same(2), palette.accent);
+    }
+}
+
 fn nav_row(
     ui: &mut Ui,
     glyph: u32,
@@ -2517,40 +2664,19 @@ fn nav_row(
     palette: FilesPalette,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(4),
-        if selected {
-            palette.selected
-        } else if response.hovered() {
-            palette.hover
-        } else {
-            Color32::TRANSPARENT
-        },
-    );
-    if selected {
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.left_top(), Vec2::new(3.0, rect.height())),
-            CornerRadius::ZERO,
-            palette.accent,
-        );
-    }
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
+    paint_nav_pill(ui, rect, selected, response.hovered(), palette);
     let y = rect.center().y;
-    let icon_rect = Rect::from_center_size(pos2(rect.left() + 12.0 + 10.0, y), Vec2::splat(20.0));
+    let icon_rect = Rect::from_center_size(pos2(rect.left() + 28.0, y), Vec2::splat(20.0));
     ui.painter().text(
         icon_rect.center(),
         egui::Align2::CENTER_CENTER,
         icons::glyph(glyph),
-        icon_font(18.0),
-        if selected {
-            palette.accent
-        } else {
-            palette.text
-        },
+        icon_font(16.0),
+        palette.text,
     );
     ui.painter().text(
-        pos2(icon_rect.right() + 12.0, y),
+        pos2(icon_rect.right() + 10.0, y),
         egui::Align2::LEFT_CENTER,
         truncate(label, 28),
         FontId::proportional(14.0),

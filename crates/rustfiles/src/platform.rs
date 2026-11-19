@@ -186,6 +186,28 @@ pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
     }
 }
 
+/// Windows accent from `DwmGetColorizationColor` (0xAARRGGBB). Linux has none.
+pub fn system_accent() -> Option<[u8; 3]> {
+    #[cfg(windows)]
+    {
+        windows::system_accent()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// RGB bytes of a `DwmGetColorizationColor` value.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn colorization_rgb(color: u32) -> [u8; 3] {
+    [
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    ]
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn window_is_visible(hwnd: isize) -> bool {
     #[cfg(windows)]
@@ -991,6 +1013,21 @@ mod windows {
         unsafe { IsWindowVisible(hwnd as HWND) != 0 }
     }
 
+    pub fn system_accent() -> Option<[u8; 3]> {
+        use windows_sys::Win32::Graphics::Dwm::DwmGetColorizationColor;
+        let mut color = 0u32;
+        let mut opaque = 0i32;
+        let hr = unsafe { DwmGetColorizationColor(&mut color, &mut opaque) };
+        if hr < 0 {
+            return None;
+        }
+        let rgb = super::colorization_rgb(color);
+        if rgb == [0, 0, 0] {
+            return None;
+        }
+        Some(rgb)
+    }
+
     /// Mica on the client area. Must run after the window is visible.
     ///
     /// Disabling non-client rendering or clearing `WS_CAPTION` removes the
@@ -1313,6 +1350,11 @@ fn filetime_ticks(time: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 #[cfg(test)]
 mod pixel_tests {
     use super::straight_rgba_from_bgra;
+
+    #[test]
+    fn colorization_dword_is_rgb() {
+        assert_eq!(super::colorization_rgb(0xFF00_78D4), [0x00, 0x78, 0xD4]);
+    }
 
     #[test]
     fn white_with_zero_alpha_stays_transparent_when_the_bitmap_has_alpha() {
