@@ -37,4 +37,4 @@ pub use usn::{
     USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE,
     USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
 };
-pub use walk::{list_directory, set_walk_thread_hook, walk_tree};
+pub use walk::{list_directory, set_walk_thread_hook, walk_tree, walk_tree_into};

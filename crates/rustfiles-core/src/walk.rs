@@ -21,7 +21,7 @@ fn walker_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(1)
             .thread_name(|index| format!("rustfiles-walk-{index}"))
             .build()
             .expect("walk pool")
@@ -51,13 +51,21 @@ fn call_walk_hook() {
 }
 
 pub fn walk_tree(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
-    walker_pool().install(|| {
-        call_walk_hook();
-        walk_tree_inner(root, progress)
-    })
+    let mut files = Vec::new();
+    walk_tree_into(root, progress, |file| files.push(file));
+    files
 }
 
-fn walk_tree_inner(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
+/// Like [`walk_tree`], but hands each file to `sink` as soon as its directory
+/// level is finished so a volume scan does not keep a second copy of every name.
+pub fn walk_tree_into(root: &Path, progress: &AtomicU64, mut sink: impl FnMut(RawFile) + Send) {
+    walker_pool().install(|| {
+        call_walk_hook();
+        walk_tree_inner(root, progress, &mut sink);
+    });
+}
+
+fn walk_tree_inner(root: &Path, progress: &AtomicU64, sink: &mut (dyn FnMut(RawFile) + Send)) {
     let modified = modified_of(root);
     let counter = AtomicU64::new(2);
     let acc = Mutex::new(vec![RawFile {
@@ -128,13 +136,18 @@ fn walk_tree_inner(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
                 let sleeps = next / 256;
                 paced.set(next % 256);
                 if sleeps > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(2 * u64::from(sleeps)));
+                    // About 32 ms of sleep per 256 files keeps an unelevated
+                    // volume walk under a tenth of one core.
+                    std::thread::sleep(std::time::Duration::from_millis(32 * u64::from(sleeps)));
                 }
             });
         });
         level = next.into_inner().expect("walk queue");
+        let mut batch = acc.lock().expect("walk accumulator");
+        for file in batch.drain(..) {
+            sink(file);
+        }
     }
-    acc.into_inner().expect("walk accumulator")
 }
 
 pub fn list_directory(path: &Path) -> crate::Result<Vec<FileRow>> {

@@ -86,6 +86,8 @@ pub struct Strings {
     pub nothing_selected: &'static str,
     pub nothing_to_paste: &'static str,
     pub deleting: &'static str,
+    pub indexing: &'static str,
+    pub index_ready: &'static str,
 }
 
 pub fn system_lang() -> Lang {
@@ -197,6 +199,8 @@ const EN: Strings = Strings {
     nothing_selected: "Select an item first.",
     nothing_to_paste: "The clipboard is empty.",
     deleting: "Deleting…",
+    indexing: "Indexing",
+    index_ready: "Index ready",
 };
 
 const FR: Strings = Strings {
@@ -277,4 +281,6 @@ const FR: Strings = Strings {
     nothing_selected: "Sélectionnez un élément.",
     nothing_to_paste: "Le presse-papiers est vide.",
     deleting: "Suppression…",
+    indexing: "Indexation",
+    index_ready: "Index prêt",
 };

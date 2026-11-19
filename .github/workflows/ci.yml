@@ -37,6 +37,28 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Self-test
         run: cargo run -p rustfiles --quiet -- --self-test
+      - name: Windows UI screenshots
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $shots = Join-Path (Get-Location) "windows-shots"
+          $data = Join-Path $env:RUNNER_TEMP "rf-data"
+          New-Item -ItemType Directory -Force -Path $shots, $data | Out-Null
+          Set-Content -Path (Join-Path $data "hello.txt") -Value "hello"
+          $env:RUSTFILES_OPEN = $data
+          $env:RUSTFILES_INDEX_PATHS = $data
+          $env:RUSTFILES_TOUR = $shots
+          $env:RUSTFILES_SIZE = "1400x900"
+          $proc = Start-Process -FilePath "target\debug\rustfiles.exe" -PassThru -NoNewWindow
+          if (-not $proc.WaitForExit(30000)) { Stop-Process -Id $proc.Id -Force }
+          Get-ChildItem $shots | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-screenshots
+          path: windows-shots
+          if-no-files-found: warn
       - name: Windows directory listing
         if: runner.os == 'Windows'
         run: cargo test -p rustfiles --bin rustfiles windows_directory_lists_through_the_ui_command -- --nocapture
@@ -111,7 +133,7 @@ jobs:
           mkdir -p upload
           [ -f rustfiles-linux-x86_64.tar.gz ] && cp rustfiles-linux-x86_64.tar.gz upload/
           [ -f rustfiles-windows-x86_64.zip ] && cp rustfiles-windows-x86_64.zip upload/
-          [ -f dist/RustFiles-0.3.4-Setup.exe ] && cp dist/RustFiles-0.3.4-Setup.exe upload/
+          [ -f dist/RustFiles-0.3.5-Setup.exe ] && cp dist/RustFiles-0.3.5-Setup.exe upload/
           ls -la upload
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

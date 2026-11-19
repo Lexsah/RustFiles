@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use rustfiles_core::flags::{DIRECTORY, HIDDEN};
 use rustfiles_core::{
-    list_directory, squarify, sunburst, walk_tree, Clipboard, FileRow, Index, IndexBuilder,
-    LiveChild, UnitRect, Weighted, METHOD_MFT, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+    list_directory, squarify, sunburst, Clipboard, FileRow, Index, IndexBuilder, LiveChild,
+    UnitRect, Weighted, METHOD_MFT, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
     USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_RENAME_NEW_NAME,
 };
 
@@ -420,7 +420,7 @@ fn boot(
         }
     }
     if needs_scan {
-        set_status(progress, "Indexing");
+        set_status(progress, "indexing");
     } else {
         arm_watches(watcher, volumes, watch_failed, progress);
     }
@@ -497,7 +497,7 @@ fn catch_up(index: &mut Index, progress: &Progress) -> bool {
 fn scan_volumes(volumes: &[DetectedVolume], progress: &Progress) -> Index {
     let mut builder = IndexBuilder::new();
     for volume in volumes {
-        set_status(progress, &format!("Indexing {}", volume.mount));
+        set_status(progress, &format!("indexing\t{}", volume.mount));
         let id = builder.add_volume(
             volume.mount.clone(),
             volume.label.clone(),
@@ -515,25 +515,28 @@ fn scan_volumes(volumes: &[DetectedVolume], progress: &Progress) -> Index {
                 Err(err) => {
                     // Access denied is the normal non-elevated path. Walk quietly.
                     if err != "access denied" {
-                        set_status(progress, &format!("Indexing {}", volume.mount));
+                        set_status(progress, &format!("indexing\t{}", volume.mount));
                     }
                     builder.set_journal(id, 0, 0, rustfiles_core::METHOD_WALK);
-                    walk_tree(Path::new(&volume.mount), &progress.files)
+                    Vec::new()
                 }
             }
         } else {
             builder.set_journal(id, 0, 0, rustfiles_core::METHOD_WALK);
-            walk_tree(Path::new(&volume.mount), &progress.files)
+            Vec::new()
         };
-        for file in files {
-            builder.add_file(id, file);
+        if files.is_empty() {
+            rustfiles_core::walk_tree_into(Path::new(&volume.mount), &progress.files, |file| {
+                builder.add_file(id, file);
+            });
+        } else {
+            for file in files {
+                builder.add_file(id, file);
+            }
         }
     }
     let index = builder.finish();
-    set_status(
-        progress,
-        &format!("Index ready, {} entries", index.entry_count()),
-    );
+    set_status(progress, &format!("ready\t{}", index.entry_count()));
     index
 }
 

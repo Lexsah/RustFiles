@@ -160,8 +160,12 @@ pub struct RustFilesApp {
     pub open_tags: bool,
     pub new_menu: bool,
     pub layout_menu: bool,
+    pub sort_menu: bool,
+    pub group_menu: bool,
     pub layout_log: Vec<(String, [f32; 4])>,
     pub shot_path: Option<PathBuf>,
+    pub tour_dir: Option<PathBuf>,
+    tour_stage: u8,
     pub layout_path: Option<PathBuf>,
     pub shot_sent: bool,
     pub settings_menu: bool,
@@ -275,8 +279,12 @@ impl RustFilesApp {
             open_tags: false,
             new_menu: false,
             layout_menu: false,
+            sort_menu: false,
+            group_menu: false,
             layout_log: Vec::new(),
             shot_path: std::env::var("RUSTFILES_SHOT").ok().map(PathBuf::from),
+            tour_dir: std::env::var("RUSTFILES_TOUR").ok().map(PathBuf::from),
+            tour_stage: 0,
             layout_path: std::env::var("RUSTFILES_LAYOUT").ok().map(PathBuf::from),
             shot_sent: false,
             settings_menu: false,
@@ -568,6 +576,8 @@ impl RustFilesApp {
         self.delete_prompt = None;
         self.context_menu = None;
         self.layout_menu = false;
+        self.sort_menu = false;
+        self.group_menu = false;
         self.new_menu = false;
         self.settings_menu = false;
         let tab = self.tab_mut();
@@ -920,6 +930,10 @@ impl RustFilesApp {
     }
 
     pub fn shot_step(&mut self, ctx: &egui::Context) {
+        if self.tour_dir.is_some() {
+            self.tour_step(ctx);
+            return;
+        }
         let Some(path) = self.shot_path.clone() else {
             return;
         };
@@ -951,6 +965,75 @@ impl RustFilesApp {
             }),
         ));
         ctx.request_repaint();
+    }
+
+    fn tour_step(&mut self, ctx: &Context) {
+        let Some(dir) = self.tour_dir.clone() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let elapsed = self.started.elapsed().as_millis();
+        let stage = (elapsed / 900).min(6) as u8;
+        if stage != self.tour_stage {
+            self.tour_stage = stage;
+            self.shot_sent = false;
+            self.layout_menu = false;
+            self.settings_menu = false;
+            self.delete_prompt = None;
+            match stage {
+                1 => self.show_home(),
+                2 => {
+                    self.layout_menu = true;
+                }
+                3 => {
+                    self.layout_menu = false;
+                    self.settings_menu = true;
+                }
+                4 => {
+                    self.settings_menu = false;
+                    self.delete_prompt = Some(DeletePrompt {
+                        paths: vec![self.tab().path.clone()],
+                        permanent: true,
+                        bytes: 4096,
+                        items: 3,
+                        label: "example".into(),
+                    });
+                }
+                5 => {
+                    self.delete_prompt = None;
+                    let path = self.tab().path.clone();
+                    self.request_analyze(path);
+                }
+                _ => {}
+            }
+        }
+        if stage >= 6 {
+            std::process::exit(0);
+        }
+        if self.shot_sent {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+        if elapsed < 500 {
+            ctx.request_repaint();
+            return;
+        }
+        self.shot_sent = true;
+        let name = match stage {
+            0 => "01-files.png",
+            1 => "02-home.png",
+            2 => "03-layout.png",
+            3 => "04-settings.png",
+            4 => "05-delete.png",
+            _ => "06-analyzer.png",
+        };
+        let path = dir.join(name);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+            egui::ScreenshotCallback::new(move |image| {
+                save_screenshot(&path, &image);
+            }),
+        ));
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
 
     pub fn request_icon(&mut self, path: &std::path::Path, px: u32) {
@@ -1055,6 +1138,11 @@ impl RustFilesApp {
     }
 }
 
+#[cfg(windows)]
+fn epaint_variation_coords() -> egui::epaint::text::VariationCoords {
+    egui::epaint::text::VariationCoords::new([(b"wght", 400.0), (b"opsz", 14.0)])
+}
+
 fn install_fonts(ctx: &Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -1070,15 +1158,18 @@ fn install_fonts(ctx: &Context) {
         .push("fluent".into());
     #[cfg(windows)]
     for file in [
-        r"C:\Windows\Fonts\segoeui.ttf",
-        r"C:\Windows\Fonts\segoeuib.ttf",
         r"C:\Windows\Fonts\SegUIVar.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
     ] {
         if let Ok(bytes) = std::fs::read(file) {
-            fonts.font_data.insert(
-                "segoe".into(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
+            let mut data = egui::FontData::from_owned(bytes);
+            data.tweak.hinting = Some(true);
+            if file.ends_with("SegUIVar.ttf") {
+                data.tweak.coords = epaint_variation_coords();
+            }
+            fonts
+                .font_data
+                .insert("segoe".into(), std::sync::Arc::new(data));
             if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 proportional.insert(0, "segoe".into());
             }
@@ -1114,6 +1205,7 @@ pub fn apply_theme(ctx: &Context, dark: bool) {
     };
     visuals.selection.bg_fill = egui::Color32::from_rgb(0, 112, 203);
     visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.text_options.font_hinting = true;
     ctx.set_visuals(visuals);
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(theme, |style| {

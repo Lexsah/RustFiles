@@ -64,7 +64,7 @@ impl RustFilesApp {
         );
         let preview = Rect::from_min_max(pos2(content.right(), body.top()), body.right_bottom());
         let side_fill = if self.mica_applied {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 72)
+            Color32::from_rgba_unmultiplied(0, 0, 0, 28)
         } else {
             palette.sidebar
         };
@@ -413,35 +413,55 @@ impl RustFilesApp {
                 self.save_config();
             }
             let layout_button = command_button(bar, icons::GRID, self.tr.layout, palette);
-            if icon_button(bar, icons::SORT, self.tr.group, palette, true).clicked() {
-                let tab = self.tab_mut();
-                tab.sort = match tab.sort {
-                    SortColumn::Name => SortColumn::Type,
-                    SortColumn::Type => SortColumn::Modified,
-                    SortColumn::Modified => SortColumn::Size,
-                    SortColumn::Size => SortColumn::Name,
-                };
-                let grouped = match tab.sort {
-                    SortColumn::Name => self.tr.name,
-                    SortColumn::Type => self.tr.kind,
-                    SortColumn::Modified => self.tr.modified,
-                    SortColumn::Size => self.tr.size,
-                };
-                self.status = format!("{}: {grouped}", self.tr.group);
-                self.sort_visible();
-            }
-            if icon_button(bar, icons::SORT, self.tr.sort, palette, true).clicked() {
-                let tab = self.tab_mut();
-                tab.ascending = !tab.ascending;
-                self.sort_visible();
-            }
+            let group_button = command_button(bar, icons::LIST, self.tr.group, palette);
+            let sort_button = command_button(bar, icons::SORT, self.tr.sort, palette);
             if icon_button(bar, icons::INFO, self.tr.analyze, palette, true).clicked() {
                 self.perform(Action::Analyzer);
             }
-            layout_button
+            (layout_button, sort_button, group_button)
         });
-        if layout_button.inner.clicked() {
+        let (layout_button, sort_button, group_button) = layout_button.inner;
+        if layout_button.clicked() {
             self.layout_menu = !self.layout_menu;
+            self.sort_menu = false;
+            self.group_menu = false;
+        }
+        if sort_button.clicked() {
+            self.sort_menu = !self.sort_menu;
+            self.group_menu = false;
+            self.layout_menu = false;
+        }
+        if group_button.clicked() {
+            self.group_menu = !self.group_menu;
+            self.sort_menu = false;
+            self.layout_menu = false;
+        }
+        let columns = [
+            (SortColumn::Name, self.tr.name, icons::DOCUMENT),
+            (SortColumn::Modified, self.tr.modified, icons::HISTORY),
+            (SortColumn::Type, self.tr.kind, icons::LIST),
+            (SortColumn::Size, self.tr.size, icons::HARD_DRIVE),
+        ];
+        if self.sort_menu {
+            let pos = sort_button.rect.left_bottom() + Vec2::new(0.0, 4.0);
+            if let Some(column) =
+                flyout(ui.ctx(), pos, 1.0, &columns, Some(self.tab().sort), palette)
+            {
+                self.tab_mut().sort = column;
+                self.sort_visible();
+                self.sort_menu = false;
+            }
+        }
+        if self.group_menu {
+            let pos = group_button.rect.left_bottom() + Vec2::new(0.0, 4.0);
+            if let Some(column) =
+                flyout(ui.ctx(), pos, 1.0, &columns, Some(self.tab().sort), palette)
+            {
+                self.tab_mut().sort = column;
+                self.sort_visible();
+                self.status = format!("{}: {}", self.tr.group, column_label(self, column));
+                self.group_menu = false;
+            }
         }
         let layout_open = ui.ctx().animate_bool_with_time(
             egui::Id::unique("layout-flyout"),
@@ -449,8 +469,8 @@ impl RustFilesApp {
             0.14,
         );
         if layout_open > 0.02 {
-            let pos = layout_button.inner.rect.left_bottom()
-                + Vec2::new(0.0, 4.0 + (1.0 - layout_open) * 6.0);
+            let pos =
+                layout_button.rect.left_bottom() + Vec2::new(0.0, 4.0 + (1.0 - layout_open) * 6.0);
             let modes = [
                 (crate::app::ViewMode::Details, self.tr.details, icons::LIST),
                 (crate::app::ViewMode::List, self.tr.list, icons::LIST),
@@ -1599,29 +1619,29 @@ impl RustFilesApp {
     }
 
     fn draw_status(&mut self, ui: &mut Ui, rect: Rect, palette: FilesPalette) {
-        let count = if self.tab().home && self.tab().search.is_empty() {
-            0
-        } else {
-            self.visible_rows().len()
-        };
+        let on_home = self.tab().home && self.tab().search.is_empty();
         let y = rect.center().y;
-        let mut text = format!("{count} {}", self.tr.items);
-        let selected = self.tab().selected.len();
-        if selected > 0 {
-            text.push_str(&format!("    {selected} {}", self.tr.selected));
+        if !on_home {
+            let count = self.visible_rows().len();
+            let mut text = format!("{count} {}", self.tr.items);
+            let selected = self.tab().selected.len();
+            if selected > 0 {
+                text.push_str(&format!("    {selected} {}", self.tr.selected));
+            }
+            ui.painter().text(
+                pos2(rect.left() + 12.0, y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                FontId::proportional(12.0),
+                palette.text_secondary,
+            );
         }
-        ui.painter().text(
-            pos2(rect.left() + 12.0, y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            FontId::proportional(12.0),
-            palette.text_secondary,
-        );
-        if !self.status.is_empty() {
+        let status = localize_status(&self.tr, &self.status);
+        if !status.is_empty() {
             ui.painter().text(
                 pos2(rect.right() - 12.0, y),
                 egui::Align2::RIGHT_CENTER,
-                truncate(&self.status, 72),
+                truncate(&status, 72),
                 FontId::proportional(12.0),
                 palette.text_secondary,
             );
@@ -1881,6 +1901,28 @@ fn drive_crumb(app: &RustFilesApp, label: &str, path: &std::path::Path) -> Strin
         .unwrap_or_else(|| label.to_string())
 }
 
+fn column_label(app: &RustFilesApp, column: SortColumn) -> &'static str {
+    match column {
+        SortColumn::Name => app.tr.name,
+        SortColumn::Modified => app.tr.modified,
+        SortColumn::Type => app.tr.kind,
+        SortColumn::Size => app.tr.size,
+    }
+}
+
+fn localize_status(tr: &crate::i18n::Strings, status: &str) -> String {
+    if status == "indexing" {
+        return tr.indexing.to_string();
+    }
+    if let Some(mount) = status.strip_prefix("indexing\t") {
+        return format!("{} {mount}", tr.indexing);
+    }
+    if let Some(count) = status.strip_prefix("ready\t") {
+        return format!("{}, {count}", tr.index_ready);
+    }
+    status.to_string()
+}
+
 fn snap_pos(ui: &Ui, pos: egui::Pos2) -> egui::Pos2 {
     let scale = ui.pixels_per_point();
     egui::pos2(
@@ -1889,41 +1931,65 @@ fn snap_pos(ui: &Ui, pos: egui::Pos2) -> egui::Pos2 {
     )
 }
 
+fn fill_px(ui: &Ui, x: f32, y: f32, w: f32, h: f32, color: Color32) {
+    let scale = ui.pixels_per_point();
+    let snap = |value: f32| (value * scale).round() / scale;
+    let unit = 1.0 / scale;
+    ui.painter().rect_filled(
+        Rect::from_min_size(
+            pos2(snap(x), snap(y)),
+            Vec2::new(snap(w).max(unit), snap(h).max(unit)),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
+}
+
+fn stroke_box(ui: &Ui, x: f32, y: f32, size: f32, color: Color32) {
+    let scale = ui.pixels_per_point();
+    let unit = 1.0 / scale;
+    fill_px(ui, x, y, size, unit, color);
+    fill_px(ui, x, y + size - unit, size, unit, color);
+    fill_px(ui, x, y, unit, size, color);
+    fill_px(ui, x + size - unit, y, unit, size, color);
+}
+
 fn paint_caption_glyph(ui: &Ui, button: Rect, id: &str, maximized: bool, color: Color32) {
     let center = snap_pos(ui, button.center());
-    let painter = ui.painter();
-    let stroke = Stroke::new(1.0, color);
+    let scale = ui.pixels_per_point();
+    let unit = 1.0 / scale;
     match id {
-        "min" => {
-            painter.hline((center.x - 5.0)..=(center.x + 5.0), center.y, stroke);
-        }
+        "min" => fill_px(ui, center.x - 5.0, center.y - unit / 2.0, 10.0, unit, color),
         "max" if maximized => {
-            let back = Rect::from_center_size(center + Vec2::new(1.0, -1.0), Vec2::splat(8.0));
-            let front = Rect::from_center_size(center + Vec2::new(-1.0, 1.0), Vec2::splat(8.0));
-            painter.rect_stroke(back, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
-            painter.rect_filled(front, CornerRadius::ZERO, Color32::TRANSPARENT);
-            painter.rect_stroke(front, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
+            let back_x = center.x - 3.0;
+            let back_y = center.y - 5.0;
+            fill_px(ui, back_x, back_y, 8.0, unit, color);
+            fill_px(ui, back_x + 8.0 - unit, back_y, unit, 8.0, color);
+            fill_px(ui, back_x, back_y, unit, 2.0, color);
+            fill_px(ui, back_x + 6.0, back_y + 8.0 - unit, 2.0, unit, color);
+            stroke_box(ui, center.x - 5.0, center.y - 3.0, 8.0, color);
         }
-        "max" => {
-            let mark = Rect::from_center_size(center, Vec2::splat(10.0));
-            painter.rect_stroke(mark, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
-        }
+        "max" => stroke_box(ui, center.x - 5.0, center.y - 5.0, 10.0, color),
         _ => {
-            let half = 5.0;
-            painter.line_segment(
-                [
-                    center + Vec2::new(-half, -half),
-                    center + Vec2::new(half, half),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + Vec2::new(half, -half),
-                    center + Vec2::new(-half, half),
-                ],
-                stroke,
-            );
+            for step in -4..=4 {
+                let offset = step as f32;
+                fill_px(
+                    ui,
+                    center.x + offset - unit / 2.0,
+                    center.y + offset - unit / 2.0,
+                    unit,
+                    unit,
+                    color,
+                );
+                fill_px(
+                    ui,
+                    center.x + offset - unit / 2.0,
+                    center.y - offset - unit / 2.0,
+                    unit,
+                    unit,
+                    color,
+                );
+            }
         }
     }
 }
@@ -2192,7 +2258,7 @@ fn icon_button(
     let color = if enabled {
         palette.text
     } else {
-        palette.text_secondary.gamma_multiply(0.45)
+        palette.text.gamma_multiply(0.72)
     };
     ui.painter().text(
         snap_pos(ui, rect.center()),
@@ -2335,7 +2401,7 @@ fn section_header(
         rect.left_center() + Vec2::new(52.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
-        FontId::proportional(13.0),
+        FontId::proportional(14.0),
         palette.text,
     );
     *open
@@ -2639,7 +2705,7 @@ fn file_line(
     icon: Option<&egui::TextureHandle>,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), palette.hover);

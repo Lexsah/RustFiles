@@ -39,8 +39,16 @@ fn main() -> eframe::Result {
         std::env::set_var("RUSTFILES_INDEX_PATHS", &smoke);
     }
 
+    let mut width = 1280.0;
+    let mut height = 800.0;
+    if let Ok(spec) = std::env::var("RUSTFILES_SIZE") {
+        if let Some((w, h)) = spec.split_once('x') {
+            width = w.parse().unwrap_or(width);
+            height = h.parse().unwrap_or(height);
+        }
+    }
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1280.0, 800.0])
+        .with_inner_size([width, height])
         .with_min_inner_size([860.0, 520.0])
         .with_title("RustFiles")
         .with_decorations(false);

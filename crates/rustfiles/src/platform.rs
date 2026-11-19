@@ -974,10 +974,15 @@ mod windows {
     pub fn enable_window_backdrop(hwnd: isize, dark: bool) {
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::Graphics::Dwm::{
-            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW,
-            DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_DISABLED,
+            DWMSBT_MAINWINDOW, DWMWA_NCRENDERING_POLICY, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
         };
         use windows_sys::Win32::UI::Controls::MARGINS;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE,
+            SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION,
+        };
         let hwnd = hwnd as HWND;
         unsafe {
             let dark_mode = u32::from(dark);
@@ -987,8 +992,17 @@ mod windows {
                 &dark_mode as *const u32 as *const _,
                 4,
             );
-            // Mica Alt, the backdrop Files uses behind its tabbed caption.
-            let backdrop = DWMSBT_TABBEDWINDOW;
+            // Stop DWM from painting its own caption buttons into the client area.
+            let policy = DWMNCRP_DISABLED;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY as u32,
+                &policy as *const i32 as *const _,
+                4,
+            );
+            let style = GetWindowLongW(hwnd, GWL_STYLE);
+            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_CAPTION as i32));
+            let backdrop = DWMSBT_MAINWINDOW;
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_SYSTEMBACKDROP_TYPE as u32,
@@ -1002,6 +1016,15 @@ mod windows {
                 cyBottomHeight: -1,
             };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            let _ = SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
         }
     }
 
