@@ -77,8 +77,15 @@ impl eframe::App for app::RustFilesApp {
         self.shot_step(ui.ctx());
         self.smoke_step(ui.ctx());
         if self.indexing {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(100));
+            let files = self
+                .progress
+                .files
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if files != self.indexed {
+                self.indexed = files;
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(500));
+            }
         }
     }
 
@@ -153,7 +160,7 @@ fn self_test() -> Result<(), String> {
     copy_into(&dir.join("hello.txt"), &copies).map_err(|err| err.to_string())?;
     let saved = dir.join("index.rfi");
     index.save(&saved).map_err(|err| err.to_string())?;
-    let loaded = Index::load(&saved).map_err(|err| err.to_string())?;
+    let mut loaded = Index::load(&saved).map_err(|err| err.to_string())?;
     if loaded.search("needle", 5).is_empty() {
         return Err("reloaded index could not search".into());
     }

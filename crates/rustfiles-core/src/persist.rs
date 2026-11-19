@@ -153,19 +153,8 @@ impl Index {
         name: &str,
     ) {
         let (name_start, name_len) = push_bytes(&mut self.names, name);
-        let lower = name.to_lowercase();
-        let (lower_start, lower_len) = push_bytes(&mut self.lowers, &lower);
         self.entries.push(EntryAccess::entry(
-            parent,
-            volume,
-            flags,
-            file_ref,
-            name_start,
-            name_len,
-            lower_start,
-            lower_len,
-            size,
-            modified,
+            parent, volume, flags, file_ref, name_start, name_len, size, modified,
         ));
     }
 }
@@ -182,8 +171,6 @@ impl EntryAccess {
         file_ref: u64,
         name_start: u32,
         name_len: u16,
-        lower_start: u32,
-        lower_len: u16,
         size: u64,
         modified: u64,
     ) -> super::index::Entry {
@@ -194,8 +181,6 @@ impl EntryAccess {
             file_ref,
             name_start,
             name_len,
-            lower_start,
-            lower_len,
             size,
             modified,
         }
@@ -275,7 +260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.rfi");
         index.save(&path).unwrap();
-        let loaded = Index::load(&path).unwrap();
+        let mut loaded = Index::load(&path).unwrap();
         assert!(loaded
             .search("report", 5)
             .iter()

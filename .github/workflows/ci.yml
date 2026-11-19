@@ -42,7 +42,7 @@ jobs:
         run: cargo test -p rustfiles --bin rustfiles windows_directory_lists_through_the_ui_command -- --nocapture
       - name: Alignment goldens
         if: runner.os == 'Linux'
-        run: xvfb-run -a cargo test -p rustfiles --test alignment -- --nocapture
+        run: xvfb-run -a -s "-screen 0 1400x900x24" cargo test -p rustfiles --test alignment -- --nocapture
       - name: GUI smoke (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -111,7 +111,7 @@ jobs:
           mkdir -p upload
           [ -f rustfiles-linux-x86_64.tar.gz ] && cp rustfiles-linux-x86_64.tar.gz upload/
           [ -f rustfiles-windows-x86_64.zip ] && cp rustfiles-windows-x86_64.zip upload/
-          [ -f dist/RustFiles-0.3.2-Setup.exe ] && cp dist/RustFiles-0.3.2-Setup.exe upload/
+          [ -f dist/RustFiles-0.3.3-Setup.exe ] && cp dist/RustFiles-0.3.3-Setup.exe upload/
           ls -la upload
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

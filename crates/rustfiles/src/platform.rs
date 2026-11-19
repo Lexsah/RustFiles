@@ -235,6 +235,70 @@ pub fn straight_rgba_from_bgra(pixels: &mut [u8]) {
     }
 }
 
+/// Shell or mime type name, cached by extension.
+pub fn describe_type(path: &Path, french: bool) -> String {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let key = format!("{}:{ext}", if french { "fr" } else { "en" });
+    if let Ok(guard) = CACHE.lock() {
+        if let Some(hit) = guard.as_ref().and_then(|map| map.get(&key)) {
+            return hit.clone();
+        }
+    }
+    let name = native_type_name(path, &ext, french);
+    if let Ok(mut guard) = CACHE.lock() {
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(key, name.clone());
+    }
+    name
+}
+
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn native_type_name(path: &Path, ext: &str, french: bool) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(name) = windows::type_name(path) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    fallback_type_name(ext, french)
+}
+
+fn fallback_type_name(ext: &str, french: bool) -> String {
+    let (fr, en) = match ext {
+        "" => ("Dossier", "Folder"),
+        "png" => ("Fichier PNG", "PNG image"),
+        "jpg" | "jpeg" => ("Fichier JPEG", "JPEG image"),
+        "gif" | "bmp" | "webp" => ("Fichier image", "Image file"),
+        "pdf" => ("Document PDF", "PDF document"),
+        "exe" | "msi" => ("Application", "Application"),
+        "zip" | "7z" | "rar" => ("Dossier compressé", "Compressed folder"),
+        "json" => ("Fichier JSON", "JSON file"),
+        "txt" | "md" | "log" => ("Document texte", "Text document"),
+        "mp3" | "flac" | "wav" => ("Fichier audio", "Audio file"),
+        "mp4" | "mkv" | "webm" => ("Fichier vidéo", "Video file"),
+        "docx" | "doc" => ("Document Microsoft Word", "Microsoft Word document"),
+        _ => ("", ""),
+    };
+    if !fr.is_empty() {
+        return if french { fr.into() } else { en.into() };
+    }
+    let upper = ext.to_ascii_uppercase();
+    if french {
+        format!("Fichier {upper}")
+    } else {
+        format!("{upper} file")
+    }
+}
+
 /// Small system icon for a path. Windows uses the shell; other platforms use the icon theme.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn file_icon_rgba(path: &Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
@@ -867,6 +931,39 @@ mod windows {
         }
         straight_rgba_from_bgra(&mut pixels);
         Some((width, height, pixels))
+    }
+
+    pub fn type_name(path: &std::path::Path) -> Option<String> {
+        use std::mem::size_of;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES,
+        };
+        let wide = wide(&path.display().to_string());
+        let mut info: SHFILEINFOW = unsafe { std::mem::zeroed() };
+        let found = unsafe {
+            SHGetFileInfoW(
+                wide.as_ptr(),
+                FILE_ATTRIBUTE_NORMAL,
+                &mut info,
+                size_of::<SHFILEINFOW>() as u32,
+                SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES,
+            )
+        };
+        if found == 0 {
+            return None;
+        }
+        let end = info
+            .szTypeName
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(info.szTypeName.len());
+        let name = String::from_utf16_lossy(&info.szTypeName[..end]);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     pub fn init_com() {

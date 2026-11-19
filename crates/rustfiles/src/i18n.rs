@@ -185,7 +185,7 @@ const EN: Strings = Strings {
 
 const FR: Strings = Strings {
     home: "Accueil",
-    favorites: "Favoris",
+    favorites: "Accès rapide",
     drives: "Lecteurs",
     cloud: "Lecteurs cloud",
     network: "Réseau",

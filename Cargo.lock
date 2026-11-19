@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "rustfiles"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "eframe",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "rustfiles-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "crc32fast",
  "rayon",

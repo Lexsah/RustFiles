@@ -1,6 +1,6 @@
 //! Window state. Drawing lives in `ui.rs`; the index lives on the worker thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -133,6 +133,8 @@ pub struct RustFilesApp {
     pub thumb_asked: HashSet<PathBuf>,
     pub icon_asked: HashSet<(PathBuf, u32)>,
     pub icon_px: HashMap<PathBuf, u32>,
+    thumb_order: VecDeque<PathBuf>,
+    icon_order: VecDeque<PathBuf>,
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
     pub lang: crate::i18n::Lang,
@@ -242,6 +244,8 @@ impl RustFilesApp {
             thumb_asked: HashSet::new(),
             icon_asked: HashSet::new(),
             icon_px: HashMap::new(),
+            thumb_order: VecDeque::new(),
+            icon_order: VecDeque::new(),
             icon_tx,
             mica_applied: false,
             lang,
@@ -414,6 +418,14 @@ impl RustFilesApp {
                         egui::TextureOptions::LINEAR,
                     ),
                 );
+                self.thumb_order.retain(|have| have != &path);
+                self.thumb_order.push_back(path);
+                while self.thumb_order.len() > 256 {
+                    if let Some(old) = self.thumb_order.pop_front() {
+                        self.thumbs.remove(&old);
+                        self.thumb_asked.remove(&old);
+                    }
+                }
             }
             Event::ShellImage {
                 path,
@@ -440,7 +452,16 @@ impl RustFilesApp {
                             egui::TextureOptions::LINEAR,
                         ),
                     );
-                    self.icon_px.insert(path, px);
+                    self.icon_px.insert(path.clone(), px);
+                    self.icon_order.retain(|have| have != &path);
+                    self.icon_order.push_back(path);
+                    while self.icon_order.len() > 256 {
+                        if let Some(old) = self.icon_order.pop_front() {
+                            self.icons_tex.remove(&old);
+                            self.icon_px.remove(&old);
+                            self.icon_asked.retain(|(asked, _)| asked != &old);
+                        }
+                    }
                 }
             }
             Event::Error(message) => {
@@ -790,7 +811,10 @@ impl RustFilesApp {
         if self.shot_sent {
             return;
         }
-        let ready = self.visible_rows().iter().any(|row| row.name == "hello.txt")
+        let ready = self
+            .visible_rows()
+            .iter()
+            .any(|row| row.name == "hello.txt")
             || self.started.elapsed() > std::time::Duration::from_millis(800);
         if !ready {
             ctx.request_repaint();
@@ -945,6 +969,24 @@ fn install_fonts(ctx: &Context) {
             break;
         }
     }
+    #[cfg(windows)]
+    for file in [
+        r"C:\Windows\Fonts\segmdl2.ttf",
+        r"C:\Windows\Fonts\SegoeIcons.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(file) {
+            fonts.font_data.insert(
+                "mdl2".into(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Name("mdl2".into()))
+                .or_default()
+                .push("mdl2".into());
+            break;
+        }
+    }
     ctx.set_fonts(fonts);
 }
 
@@ -1060,14 +1102,4 @@ fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
             .collect::<Vec<_>>()
     };
     normalize(left) == normalize(right)
-}
-
-pub fn type_name(row: &FileRow) -> String {
-    if row.is_dir {
-        return "Folder".into();
-    }
-    match row.name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => ext.to_ascii_uppercase(),
-        _ => "File".into(),
-    }
 }

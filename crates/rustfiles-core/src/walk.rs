@@ -10,13 +10,54 @@ use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::flags::{self, DIRECTORY, HIDDEN};
 use crate::model::{FileRow, RawFile};
 
 const SKIP_AT_ROOT: &[&str] = &["proc", "sys", "dev", "run"];
 
+fn walker_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|index| format!("rustfiles-walk-{index}"))
+            .build()
+            .expect("walk pool")
+    })
+}
+
+static WALK_HOOK: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+/// Called once on each walk thread. The binary uses this to drop thread priority.
+pub fn set_walk_thread_hook(hook: fn()) {
+    *WALK_HOOK.lock().expect("walk hook") = Some(hook);
+}
+
+fn call_walk_hook() {
+    thread_local! {
+        static ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    ONCE.with(|done| {
+        if done.get() {
+            return;
+        }
+        done.set(true);
+        if let Some(hook) = *WALK_HOOK.lock().expect("walk hook") {
+            hook();
+        }
+    });
+}
+
 pub fn walk_tree(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
+    walker_pool().install(|| {
+        call_walk_hook();
+        walk_tree_inner(root, progress)
+    })
+}
+
+fn walk_tree_inner(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
     let modified = modified_of(root);
     let counter = AtomicU64::new(2);
     let acc = Mutex::new(vec![RawFile {
@@ -74,8 +115,22 @@ pub fn walk_tree(root: &Path, progress: &AtomicU64) -> Vec<RawFile> {
                     children.push((entry.path(), id, false));
                 }
             }
+            let paced_files = local.len() as u32;
             acc.lock().expect("walk accumulator").append(&mut local);
             next.lock().expect("walk queue").append(&mut children);
+            // Each walk thread yields 2ms per 256 files so a full-disk scan stays
+            // off the UI thread and under about one core.
+            std::thread_local! {
+                static PACED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            PACED.with(|paced| {
+                let next = paced.get().saturating_add(paced_files);
+                let sleeps = next / 256;
+                paced.set(next % 256);
+                if sleeps > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(2 * u64::from(sleeps)));
+                }
+            });
         });
         level = next.into_inner().expect("walk queue");
     }
@@ -227,5 +282,74 @@ mod tests {
         assert!(listing.iter().all(|row| row.name != ".hidden"));
         let with_hidden = index.list_dir(root_id, true);
         assert!(with_hidden.iter().any(|row| row.name == ".hidden"));
+    }
+
+    #[test]
+    fn throttled_walk_of_a_synthetic_tree() {
+        let root = std::env::temp_dir().join(format!("rustfiles-bench-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let dirs: u32 = std::env::var("RUSTFILES_BENCH_DIRS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(80);
+        let per_dir: u32 = std::env::var("RUSTFILES_BENCH_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100);
+        for dir in 0..dirs {
+            let folder = root.join(format!("dir-{dir}"));
+            fs::create_dir(&folder).unwrap();
+            for file in 0..per_dir {
+                fs::write(folder.join(format!("f-{file}.bin")), vec![0u8; 32]).unwrap();
+            }
+        }
+        let started = std::time::Instant::now();
+        let cpu_before = process_cpu_ticks();
+        let progress = AtomicU64::new(0);
+        let files = walk_tree(&root, &progress);
+        let elapsed = started.elapsed();
+        let cpu_ticks = process_cpu_ticks().saturating_sub(cpu_before);
+        let mut builder = IndexBuilder::new();
+        let volume = builder.add_volume(root.display().to_string(), "bench".into(), false);
+        for file in files {
+            builder.add_file(volume, file);
+        }
+        let index = builder.finish();
+        let count = index.entry_count().max(1);
+        let bytes = index.resident_bytes();
+        eprintln!(
+            "synthetic walk files={count} threads={} elapsed_ms={} cpu_ms={} resident_bytes={bytes} bytes_per_entry={}",
+            walker_pool().current_num_threads(),
+            elapsed.as_millis(),
+            cpu_ticks * 1000 / ticks_per_second(),
+            bytes / count
+        );
+        assert!(count >= (dirs as usize) * (per_dir as usize));
+        assert!(bytes / count < 100, "{}", bytes / count);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn process_cpu_ticks() -> u64 {
+        let Ok(text) = std::fs::read_to_string("/proc/self/stat") else {
+            return 0;
+        };
+        let Some((_, rest)) = text.split_once(')') else {
+            return 0;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let user = fields
+            .get(11)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let system = fields
+            .get(12)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        user + system
+    }
+
+    fn ticks_per_second() -> u64 {
+        100
     }
 }

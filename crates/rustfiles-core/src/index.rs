@@ -28,10 +28,74 @@ pub(crate) struct Entry {
     pub(crate) file_ref: u64,
     pub(crate) name_start: u32,
     pub(crate) name_len: u16,
-    pub(crate) lower_start: u32,
-    pub(crate) lower_len: u16,
     pub(crate) size: u64,
     pub(crate) modified: u64,
+}
+
+/// File-reference lookup. Record numbers that sit near the entry id live in a
+/// flat table (4 bytes each). Outliers stay in a hash map so a sparse NTFS
+/// reference cannot allocate a giant array.
+#[derive(Clone, Debug)]
+struct Refs {
+    dense: Vec<Vec<u32>>,
+    sparse: FxHashMap<(u16, u64), u32>,
+}
+
+const REF_ABSENT: u32 = u32::MAX;
+
+impl Refs {
+    fn new() -> Self {
+        Self {
+            dense: Vec::new(),
+            sparse: FxHashMap::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.dense.clear();
+        self.sparse.clear();
+    }
+
+    fn get(&self, volume: u16, file_ref: u64) -> Option<u32> {
+        let slot = (file_ref & 0x0000_FFFF_FFFF_FFFF) as usize;
+        if let Some(table) = self.dense.get(volume as usize) {
+            if let Some(&id) = table.get(slot) {
+                if id != REF_ABSENT {
+                    return Some(id);
+                }
+            }
+        }
+        self.sparse.get(&(volume, file_ref)).copied()
+    }
+
+    fn insert(&mut self, volume: u16, file_ref: u64, id: u32) {
+        let slot_key = file_ref & 0x0000_FFFF_FFFF_FFFF;
+        let near = slot_key <= (id as u64).saturating_mul(3).saturating_add(8_192)
+            && slot_key <= 8_000_000;
+        if near {
+            let slot = slot_key as usize;
+            if self.dense.len() <= volume as usize {
+                self.dense.resize(volume as usize + 1, Vec::new());
+            }
+            let table = &mut self.dense[volume as usize];
+            if table.len() <= slot {
+                table.resize(slot + 1, REF_ABSENT);
+            }
+            table[slot] = id;
+            self.sparse.remove(&(volume, file_ref));
+        } else {
+            self.sparse.insert((volume, file_ref), id);
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        let mut total = self.sparse.capacity()
+            * (std::mem::size_of::<(u16, u64)>() + std::mem::size_of::<u32>());
+        for table in &self.dense {
+            total += table.capacity() * std::mem::size_of::<u32>();
+        }
+        total
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,10 +103,11 @@ pub struct Index {
     pub(crate) volumes: Vec<Volume>,
     pub(crate) entries: Vec<Entry>,
     pub(crate) names: Vec<u8>,
-    pub(crate) lowers: Vec<u8>,
-    children: Vec<Vec<u32>>,
-    refs: FxHashMap<(u16, u64), u32>,
+    /// Only directories with children are present. Files do not pay for an empty `Vec`.
+    children: FxHashMap<u32, Vec<u32>>,
+    refs: Refs,
     trigrams: FxHashMap<u32, Vec<u32>>,
+    trigrams_ready: bool,
     sizes: Vec<u64>,
     sizes_valid: bool,
     pub(crate) next_file_ref: u64,
@@ -172,10 +237,10 @@ impl Index {
             volumes: Vec::new(),
             entries: Vec::new(),
             names: Vec::new(),
-            lowers: Vec::new(),
-            children: Vec::new(),
-            refs: FxHashMap::default(),
+            children: FxHashMap::default(),
+            refs: Refs::new(),
             trigrams: FxHashMap::default(),
+            trigrams_ready: false,
             sizes: Vec::new(),
             sizes_valid: false,
             next_file_ref: 1,
@@ -186,6 +251,26 @@ impl Index {
         &self.volumes
     }
 
+    /// Approximate heap use of the live index, excluding allocator overhead.
+    pub fn resident_bytes(&self) -> usize {
+        let mut total = self.entries.len() * std::mem::size_of::<Entry>();
+        total += self.names.capacity();
+        total +=
+            self.children.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<Vec<u32>>());
+        for list in self.children.values() {
+            total += list.capacity() * std::mem::size_of::<u32>();
+        }
+        total += self.refs.bytes();
+        if self.trigrams_ready {
+            total += self.trigrams.capacity() * 32;
+            for list in self.trigrams.values() {
+                total += list.capacity() * std::mem::size_of::<u32>();
+            }
+        }
+        total += self.sizes.capacity() * std::mem::size_of::<u64>();
+        total
+    }
+
     pub fn entry_count(&self) -> usize {
         self.entries
             .iter()
@@ -194,7 +279,7 @@ impl Index {
     }
 
     pub fn name_of(&self, id: u32) -> &str {
-        self.text(id, false)
+        self.text(id)
     }
 
     pub fn set_journal(&mut self, volume: u16, journal_id: u64, next_usn: i64) {
@@ -204,7 +289,8 @@ impl Index {
         }
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+    pub fn search(&mut self, query: &str, limit: usize) -> Vec<SearchHit> {
+        self.ensure_trigrams();
         if limit == 0 {
             return Vec::new();
         }
@@ -309,10 +395,7 @@ impl Index {
 
     pub fn list_dir(&mut self, id: u32, show_hidden: bool) -> Vec<FileRow> {
         self.ensure_sizes();
-        let children = match self.children.get(id as usize) {
-            Some(children) => children.clone(),
-            None => return Vec::new(),
-        };
+        let children = self.children.get(&id).cloned().unwrap_or_default();
         let mut rows = Vec::new();
         for child in children {
             if !self.alive(child) {
@@ -370,12 +453,17 @@ impl Index {
                 if state[id] == 0 {
                     state[id] = 1;
                     if is_dir {
-                        let pending: Vec<usize> = self.children[id]
-                            .iter()
-                            .copied()
-                            .map(|child| child as usize)
-                            .filter(|child| *child < count && state[*child] == 0)
-                            .collect();
+                        let pending: Vec<usize> = self
+                            .children
+                            .get(&(id as u32))
+                            .map(|list| {
+                                list.iter()
+                                    .copied()
+                                    .map(|child| child as usize)
+                                    .filter(|child| *child < count && state[*child] == 0)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         if !pending.is_empty() {
                             stack.extend(pending);
                             continue;
@@ -383,9 +471,16 @@ impl Index {
                     }
                 }
                 self.sizes[id] = if is_dir {
-                    self.children[id].iter().fold(0u64, |sum, child| {
-                        sum.saturating_add(self.sizes.get(*child as usize).copied().unwrap_or(0))
-                    })
+                    self.children
+                        .get(&(id as u32))
+                        .map(|list| list.iter())
+                        .into_iter()
+                        .flatten()
+                        .fold(0u64, |sum, child| {
+                            sum.saturating_add(
+                                self.sizes.get(*child as usize).copied().unwrap_or(0),
+                            )
+                        })
                 } else {
                     self.entries[id].size
                 };
@@ -402,7 +497,7 @@ impl Index {
 
     pub fn child_weights(&mut self, id: u32) -> Vec<crate::analyze::Weighted> {
         self.ensure_sizes();
-        let children = self.children.get(id as usize).cloned().unwrap_or_default();
+        let children = self.children.get(&id).cloned().unwrap_or_default();
         let mut items: Vec<_> = children
             .into_iter()
             .filter(|child| self.alive(*child))
@@ -436,13 +531,13 @@ impl Index {
         let old_name = record.reason & USN_REASON_RENAME_OLD_NAME != 0;
         let create = record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0;
         if delete && !create {
-            if let Some(&id) = self.refs.get(&(volume, record.file_ref)) {
+            if let Some(id) = self.refs.get(volume, record.file_ref) {
                 self.tombstone_tree(id);
             }
             return;
         }
         if old_name && !create {
-            if let Some(&id) = self.refs.get(&(volume, record.file_ref)) {
+            if let Some(id) = self.refs.get(volume, record.file_ref) {
                 self.tombstone(id);
             }
         }
@@ -461,7 +556,7 @@ impl Index {
     }
 
     pub fn set_metadata(&mut self, volume: u16, file_ref: u64, size: u64, modified: u64) -> bool {
-        let Some(&id) = self.refs.get(&(volume, file_ref)) else {
+        let Some(id) = self.refs.get(volume, file_ref) else {
             return false;
         };
         if !self.alive(id) {
@@ -476,7 +571,7 @@ impl Index {
     }
 
     pub fn path_for_ref(&self, volume: u16, file_ref: u64) -> Option<String> {
-        let id = *self.refs.get(&(volume, file_ref))?;
+        let id = self.refs.get(volume, file_ref)?;
         if !self.alive(id) {
             return None;
         }
@@ -491,7 +586,7 @@ impl Index {
         }
         let volume = self.entries[dir as usize].volume;
         let insensitive = self.volumes[volume as usize].case_insensitive;
-        let existing = self.children.get(dir as usize).cloned().unwrap_or_default();
+        let existing = self.children.get(&dir).cloned().unwrap_or_default();
         let mut used = vec![false; live.len()];
         for child in existing {
             if !self.alive(child) {
@@ -568,20 +663,17 @@ impl Index {
         let parent = if parent_ref == file_ref {
             NO_PARENT
         } else {
-            self.refs
-                .get(&(volume, parent_ref))
-                .copied()
-                .unwrap_or(NO_PARENT)
+            self.refs.get(volume, parent_ref).unwrap_or(NO_PARENT)
         };
-        if let Some(&id) = self.refs.get(&(volume, file_ref)) {
+        if let Some(id) = self.refs.get(volume, file_ref) {
             let was_dead = self.entries[id as usize].flags & TOMBSTONE != 0;
             self.clear_trigrams(id);
             let old_parent = self.entries[id as usize].parent;
             if old_parent != parent || was_dead {
                 self.detach(old_parent, id);
                 self.entries[id as usize].parent = parent;
-                if parent != NO_PARENT && (parent as usize) < self.children.len() {
-                    self.children[parent as usize].push(id);
+                if parent != NO_PARENT {
+                    self.children.entry(parent).or_default().push(id);
                 }
             }
             self.set_name(id, name);
@@ -625,8 +717,6 @@ impl Index {
     ) -> u32 {
         let id = self.entries.len() as u32;
         let (name_start, name_len) = push_str(&mut self.names, name);
-        let lower = name.to_lowercase();
-        let (lower_start, lower_len) = push_str(&mut self.lowers, &lower);
         self.entries.push(Entry {
             parent,
             volume,
@@ -634,16 +724,13 @@ impl Index {
             file_ref,
             name_start,
             name_len,
-            lower_start,
-            lower_len,
             size,
             modified,
         });
-        self.children.push(Vec::new());
-        if parent != NO_PARENT && (parent as usize) < self.children.len() - 1 {
-            self.children[parent as usize].push(id);
+        if parent != NO_PARENT && (parent as usize) < self.entries.len() - 1 {
+            self.children.entry(parent).or_default().push(id);
         }
-        self.refs.insert((volume, file_ref), id);
+        self.refs.insert(volume, file_ref, id);
         self.add_trigrams(id);
         if file_ref >= self.next_file_ref {
             self.next_file_ref = file_ref.saturating_add(1);
@@ -671,7 +758,7 @@ impl Index {
                 continue;
             }
             order.push(current);
-            if let Some(children) = self.children.get(current as usize) {
+            if let Some(children) = self.children.get(&current) {
                 stack.extend(children.iter().copied());
             }
         }
@@ -681,15 +768,13 @@ impl Index {
     }
 
     fn detach(&mut self, parent: u32, child: u32) {
-        if let Some(list) = self.children.get_mut(parent as usize) {
+        if let Some(list) = self.children.get_mut(&parent) {
             list.retain(|id| *id != child);
         }
     }
 
     fn push_entry(&mut self, volume: u16, file: &RawFile, parent: u32) {
         let (name_start, name_len) = push_str(&mut self.names, &file.name);
-        let lower = file.name.to_lowercase();
-        let (lower_start, lower_len) = push_str(&mut self.lowers, &lower);
         self.entries.push(Entry {
             parent,
             volume,
@@ -697,8 +782,6 @@ impl Index {
             file_ref: file.file_ref,
             name_start,
             name_len,
-            lower_start,
-            lower_len,
             size: file.size,
             modified: file.modified,
         });
@@ -706,9 +789,10 @@ impl Index {
 
     pub(crate) fn rebuild_derived(&mut self) {
         let count = self.entries.len();
-        self.children = vec![Vec::new(); count];
+        self.children.clear();
         self.refs.clear();
         self.trigrams.clear();
+        self.trigrams_ready = false;
         for index in 0..count {
             if self.entries[index].flags & TOMBSTONE != 0 {
                 continue;
@@ -716,23 +800,14 @@ impl Index {
             let volume = self.entries[index].volume;
             let file_ref = self.entries[index].file_ref;
             let parent = self.entries[index].parent;
-            self.refs.insert((volume, file_ref), index as u32);
+            self.refs.insert(volume, file_ref, index as u32);
             if parent != NO_PARENT
                 && (parent as usize) < count
                 && parent as usize != index
                 && self.entries[parent as usize].flags & TOMBSTONE == 0
             {
-                self.children[parent as usize].push(index as u32);
+                self.children.entry(parent).or_default().push(index as u32);
             }
-        }
-        for index in 0..count {
-            if self.entries[index].flags & TOMBSTONE == 0 {
-                self.add_trigrams_bulk(index as u32);
-            }
-        }
-        for list in self.trigrams.values_mut() {
-            list.sort_unstable();
-            list.dedup();
         }
         self.sizes_valid = false;
         self.sizes.clear();
@@ -749,7 +824,7 @@ impl Index {
         if !self.alive(id) {
             return;
         }
-        let name = self.lower(id);
+        let name = self.name_of(id).to_lowercase();
         if name.is_empty() {
             return;
         }
@@ -766,9 +841,9 @@ impl Index {
             }
         }
         let rank = Rank {
-            score: score(name, needle),
+            score: score(&name, needle),
             len: name.len() as u32,
-            name: name.to_string(),
+            name,
             id,
         };
         if heap.len() < limit {
@@ -794,7 +869,7 @@ impl Index {
     }
 
     fn child_named(&self, parent: u32, name: &str, insensitive: bool) -> Option<u32> {
-        let children = self.children.get(parent as usize)?;
+        let children = self.children.get(&parent)?;
         children
             .iter()
             .copied()
@@ -828,41 +903,28 @@ impl Index {
         self.alive(id) && self.entries[id as usize].flags & DIRECTORY != 0
     }
 
-    fn text(&self, id: u32, lower: bool) -> &str {
+    fn text(&self, id: u32) -> &str {
         let entry = &self.entries[id as usize];
-        let bytes = if lower { &self.lowers } else { &self.names };
-        let start = if lower {
-            entry.lower_start
-        } else {
-            entry.name_start
-        } as usize;
-        let len = if lower {
-            entry.lower_len
-        } else {
-            entry.name_len
-        } as usize;
-        let end = start.saturating_add(len).min(bytes.len());
-        std::str::from_utf8(bytes.get(start..end).unwrap_or_default()).unwrap_or("")
-    }
-
-    fn lower(&self, id: u32) -> &str {
-        self.text(id, true)
+        let start = entry.name_start as usize;
+        let len = entry.name_len as usize;
+        let end = start.saturating_add(len).min(self.names.len());
+        std::str::from_utf8(self.names.get(start..end).unwrap_or_default()).unwrap_or("")
     }
 
     fn set_name(&mut self, id: u32, name: &str) {
         let (name_start, name_len) = push_str(&mut self.names, name);
-        let lower = name.to_lowercase();
-        let (lower_start, lower_len) = push_str(&mut self.lowers, &lower);
         let entry = &mut self.entries[id as usize];
         entry.name_start = name_start;
         entry.name_len = name_len;
-        entry.lower_start = lower_start;
-        entry.lower_len = lower_len;
     }
 
     fn clear_trigrams(&mut self, id: u32) {
-        let bytes = self.lower(id).as_bytes().to_vec();
-        for gram in unique_trigrams(&bytes) {
+        if !self.trigrams_ready {
+            return;
+        }
+        let folded = self.name_of(id).to_lowercase();
+        let bytes = folded.as_bytes();
+        for gram in unique_trigrams(bytes) {
             if let Some(list) = self.trigrams.get_mut(&gram) {
                 if let Ok(position) = list.binary_search(&id) {
                     list.remove(position);
@@ -872,8 +934,12 @@ impl Index {
     }
 
     fn add_trigrams(&mut self, id: u32) {
-        let bytes = self.lower(id).as_bytes().to_vec();
-        for gram in unique_trigrams(&bytes) {
+        if !self.trigrams_ready {
+            return;
+        }
+        let folded = self.name_of(id).to_lowercase();
+        let bytes = folded.as_bytes();
+        for gram in unique_trigrams(bytes) {
             let list = self.trigrams.entry(gram).or_default();
             if let Err(position) = list.binary_search(&id) {
                 list.insert(position, id);
@@ -881,9 +947,27 @@ impl Index {
         }
     }
 
+    fn ensure_trigrams(&mut self) {
+        if self.trigrams_ready {
+            return;
+        }
+        self.trigrams.clear();
+        let count = self.entries.len();
+        for index in 0..count {
+            if self.entries[index].flags & TOMBSTONE == 0 {
+                self.add_trigrams_bulk(index as u32);
+            }
+        }
+        for list in self.trigrams.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+        self.trigrams_ready = true;
+    }
+
     fn add_trigrams_bulk(&mut self, id: u32) {
-        let bytes = self.lower(id).as_bytes().to_vec();
-        for gram in unique_trigrams(&bytes) {
+        let folded = self.name_of(id).to_lowercase();
+        for gram in unique_trigrams(folded.as_bytes()) {
             self.trigrams.entry(gram).or_default().push(id);
         }
     }
@@ -1114,7 +1198,7 @@ mod tests {
 
     #[test]
     fn search_ranks_exact_then_prefix_then_substring() {
-        let index = sample();
+        let mut index = sample();
         let hits = index.search("report", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "Annual Report.pdf");
@@ -1242,5 +1326,31 @@ mod tests {
         let index = builder.finish();
         let id = index.find_path("c:/users/readme.md").unwrap();
         assert_eq!(index.path(id), "C:\\Users\\Readme.md");
+    }
+
+    #[test]
+    fn index_stays_compact_before_the_first_search() {
+        let mut builder = IndexBuilder::new();
+        let volume = builder.add_volume("/data".into(), "data".into(), false);
+        builder.add_file(volume, raw(1, 1, "", 0, DIRECTORY));
+        for index in 0..20_000 {
+            let dir = 2 + (index % 50);
+            if index < 50 {
+                builder.add_file(volume, raw(dir, 1, &format!("d{dir}"), 0, DIRECTORY));
+            }
+            builder.add_file(
+                volume,
+                raw(1_000 + index, dir, &format!("file-{index}.txt"), 128, 0),
+            );
+        }
+        let index = builder.finish();
+        let count = index.entry_count().max(1);
+        let bytes = index.resident_bytes();
+        let per = bytes / count;
+        eprintln!("index entries={count} resident_bytes={bytes} bytes_per_entry={per}");
+        assert!(
+            per < 100,
+            "index uses {per} bytes/entry ({bytes} for {count})"
+        );
     }
 }

@@ -219,6 +219,7 @@ fn worker_loop(
                     let volumes_for_scan = volumes.clone();
                     let progress_for_scan = Arc::clone(&progress);
                     scan_job = Some(std::thread::spawn(move || {
+                        lower_priority();
                         scan_volumes(&volumes_for_scan, &progress_for_scan)
                     }));
                 }
@@ -266,6 +267,7 @@ fn worker_loop(
             let volumes_for_scan = volumes.clone();
             let progress_for_scan = Arc::clone(&progress);
             scan_job = Some(std::thread::spawn(move || {
+                lower_priority();
                 scan_volumes(&volumes_for_scan, &progress_for_scan)
             }));
             next_rescan = Instant::now() + Duration::from_secs(180);
@@ -581,8 +583,8 @@ fn list(
     });
 }
 
-fn search(index: &Option<Index>, events: &Sender<Event>, query: String, req: u64) {
-    let Some(index) = index else {
+fn search(index: &mut Option<Index>, events: &Sender<Event>, query: String, req: u64) {
+    let Some(index) = index.as_mut() else {
         let _ = events.send(Event::SearchResult {
             req,
             query,
@@ -852,6 +854,26 @@ fn queue_watch(pending: &mut Vec<PathBuf>, event: &NotifyEvent) {
         if !pending.iter().any(|have| have == &dir) {
             pending.push(dir);
         }
+    }
+}
+
+fn lower_priority() {
+    rustfiles_core::set_walk_thread_hook(lower_priority_thread);
+    lower_priority_thread();
+}
+
+fn lower_priority_thread() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as u32;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 
