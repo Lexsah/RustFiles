@@ -179,7 +179,8 @@ fn icon_loop(jobs: Receiver<IconJob>, events: Sender<Event>, repaint: egui::Cont
             height,
             rgba,
         });
-        repaint.request_repaint();
+        // Icon uploads must not schedule a 60 Hz repaint while a volume is indexing.
+        repaint.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
 

@@ -172,16 +172,30 @@ pub fn init_com() {
     }
 }
 
-/// Extend the window frame and ask Windows 11 for Mica Alt (the Files backdrop).
+/// Extend the window frame and ask Windows 11 for Mica (`DWMSBT_MAINWINDOW`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn enable_window_backdrop(hwnd: isize, dark: bool) {
+pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
     #[cfg(windows)]
     {
-        windows::enable_window_backdrop(hwnd, dark);
+        windows::enable_window_backdrop(hwnd, dark)
     }
     #[cfg(not(windows))]
     {
         let _ = (hwnd, dark);
+        false
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn window_is_visible(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        windows::window_is_visible(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
     }
 }
 
@@ -971,42 +985,52 @@ mod windows {
         let _ = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
     }
 
-    pub fn enable_window_backdrop(hwnd: isize, dark: bool) {
+    pub fn window_is_visible(hwnd: isize) -> bool {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        unsafe { IsWindowVisible(hwnd as HWND) != 0 }
+    }
+
+    /// Mica on the client area. Must run after the window is visible.
+    ///
+    /// Disabling non-client rendering or clearing `WS_CAPTION` removes the
+    /// system backdrop, which is why the window stayed flat `#1c1c1c`.
+    /// winit's transparent flag also enables blur-behind, and that conflicts
+    /// with `DWMWA_SYSTEMBACKDROP_TYPE`, so blur-behind is turned off first.
+    pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::Graphics::Dwm::{
-            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_DISABLED,
-            DWMSBT_MAINWINDOW, DWMWA_NCRENDERING_POLICY, DWMWA_SYSTEMBACKDROP_TYPE,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+            DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
         };
         use windows_sys::Win32::UI::Controls::MARGINS;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE,
-            SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION,
+            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOREDIRECTIONBITMAP,
         };
         let hwnd = hwnd as HWND;
         unsafe {
+            let blur = DWM_BLURBEHIND {
+                dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                fEnable: false.into(),
+                hRgnBlur: std::ptr::null_mut(),
+                fTransitionOnMaximized: false.into(),
+            };
+            let _ = DwmEnableBlurBehindWindow(hwnd, &blur);
+            // Compose the GL framebuffer's alpha directly so a transparent clear
+            // shows the Mica material instead of an opaque redirection surface.
+            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(
+                hwnd,
+                GWL_EXSTYLE,
+                ex_style | WS_EX_NOREDIRECTIONBITMAP as i32,
+            );
             let dark_mode = u32::from(dark);
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
                 &dark_mode as *const u32 as *const _,
-                4,
-            );
-            // Stop DWM from painting its own caption buttons into the client area.
-            let policy = DWMNCRP_DISABLED;
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_NCRENDERING_POLICY as u32,
-                &policy as *const i32 as *const _,
-                4,
-            );
-            let style = GetWindowLongW(hwnd, GWL_STYLE);
-            SetWindowLongW(hwnd, GWL_STYLE, style & !(WS_CAPTION as i32));
-            let backdrop = DWMSBT_MAINWINDOW;
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_SYSTEMBACKDROP_TYPE as u32,
-                &backdrop as *const i32 as *const _,
                 4,
             );
             let margins = MARGINS {
@@ -1016,6 +1040,13 @@ mod windows {
                 cyBottomHeight: -1,
             };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            let backdrop = DWMSBT_MAINWINDOW;
+            let hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                &backdrop as *const i32 as *const _,
+                4,
+            );
             let _ = SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
@@ -1025,6 +1056,7 @@ mod windows {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
             );
+            hr >= 0
         }
     }
 
@@ -1142,6 +1174,140 @@ mod windows {
         straight_rgba_from_bgra(&mut pixels);
         Some((width, height, pixels))
     }
+}
+
+/// Cumulative CPU time per thread, in milliseconds, with the thread name.
+pub fn thread_cpu_ms() -> Vec<(String, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_thread_cpu_ms()
+    }
+    #[cfg(windows)]
+    {
+        windows_thread_cpu_ms()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_thread_cpu_ms() -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return out;
+    };
+    for task in tasks.flatten() {
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.len() <= 12 {
+            continue;
+        }
+        let user: u64 = fields[11].parse().unwrap_or(0);
+        let system: u64 = fields[12].parse().unwrap_or(0);
+        let ms = (user + system).saturating_mul(1000) / ticks_per_second();
+        let name = std::fs::read_to_string(task.path().join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let name = if name.is_empty() {
+            task.file_name().to_string_lossy().into_owned()
+        } else {
+            name
+        };
+        out.push((name, ms));
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn ticks_per_second() -> u64 {
+    unsafe { libc::sysconf(libc::_SC_CLK_TCK).max(1) as u64 }
+}
+
+#[cfg(windows)]
+fn windows_thread_cpu_ms() -> Vec<(String, u64)> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, GetThreadDescription, GetThreadTimes, OpenThread,
+        THREAD_QUERY_LIMITED_INFORMATION,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot.is_null() || snapshot as isize == -1 {
+            return out;
+        }
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..std::mem::zeroed()
+        };
+        let pid = GetCurrentProcessId();
+        if Thread32First(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    let thread =
+                        OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.th32ThreadID);
+                    if !thread.is_null() {
+                        let mut created = FILETIME {
+                            dwLowDateTime: 0,
+                            dwHighDateTime: 0,
+                        };
+                        let mut exited = created;
+                        let mut kernel = created;
+                        let mut user = created;
+                        if GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user)
+                            != 0
+                        {
+                            let ticks = filetime_ticks(kernel) + filetime_ticks(user);
+                            let mut wide = std::ptr::null_mut();
+                            let hr = GetThreadDescription(thread, &mut wide);
+                            let name = if hr >= 0 && !wide.is_null() {
+                                let mut len = 0usize;
+                                while *wide.add(len) != 0 {
+                                    len += 1;
+                                }
+                                let text =
+                                    String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+                                LocalFree(wide as _);
+                                text
+                            } else {
+                                String::new()
+                            };
+                            let name = if name.is_empty() {
+                                format!("tid-{}", entry.th32ThreadID)
+                            } else {
+                                name
+                            };
+                            out.push((name, ticks / 10_000));
+                        }
+                        CloseHandle(thread);
+                    }
+                }
+                entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                if Thread32Next(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn filetime_ticks(time: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (time.dwHighDateTime as u64) << 32 | time.dwLowDateTime as u64
 }
 
 #[cfg(test)]

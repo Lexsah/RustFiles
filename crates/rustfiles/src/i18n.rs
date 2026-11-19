@@ -256,7 +256,7 @@ const FR: Strings = Strings {
     icons: "Icônes",
     details: "Détails",
     sort: "Trier",
-    group: "Grouper",
+    group: "Regrouper",
     layout: "Disposition",
     list: "Liste",
     tiles: "Mosaïques",
