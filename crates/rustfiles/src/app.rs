@@ -46,7 +46,7 @@ impl Tab {
             hist_pos: 0,
             path,
             home,
-            details: true,
+            details: false,
             sort: SortColumn::Name,
             ascending: true,
             selected: Vec::new(),
@@ -121,9 +121,20 @@ pub struct RustFilesApp {
     pub preview_note: String,
     pub thumbs: HashMap<PathBuf, egui::TextureHandle>,
     pub icons_tex: HashMap<PathBuf, egui::TextureHandle>,
-    pub icon_miss: HashSet<PathBuf>,
     pub thumb_asked: HashSet<PathBuf>,
+    pub icon_asked: HashSet<(PathBuf, u32)>,
+    pub icon_px: HashMap<PathBuf, u32>,
+    pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
+    pub tr: crate::i18n::Strings,
+    pub open_fav: bool,
+    pub open_drives: bool,
+    pub open_cloud: bool,
+    pub open_network: bool,
+    pub open_wsl: bool,
+    pub open_tags: bool,
+    pub new_menu: bool,
+    pub settings_menu: bool,
     pub cache: HashMap<PathBuf, Vec<FileRow>>,
     req: u64,
     smoke: Option<Smoke>,
@@ -141,7 +152,7 @@ impl RustFilesApp {
             files: std::sync::atomic::AtomicU64::new(0),
             status: std::sync::Mutex::new("Starting".into()),
         });
-        worker::spawn(
+        let icon_tx = worker::spawn(
             command_rx,
             event_tx,
             cc.egui_ctx.clone(),
@@ -150,7 +161,20 @@ impl RustFilesApp {
         let _ = commands.send(Command::Boot);
         let places = platform::places();
         let smoke_path = std::env::var("RUSTFILES_SMOKE").ok().map(PathBuf::from);
-        let start = smoke_path.clone().unwrap_or_else(|| places.home.clone());
+        let opened = std::env::var("RUSTFILES_OPEN").ok().map(PathBuf::from);
+        let mut start = smoke_path
+            .clone()
+            .or_else(|| opened.clone())
+            .unwrap_or_else(|| places.home.clone());
+        let mut select_file = None;
+        if smoke_path.is_none() && start.is_file() {
+            select_file = Some(start.clone());
+            if let Some(parent) = start.parent() {
+                if !parent.as_os_str().is_empty() {
+                    start = parent.to_path_buf();
+                }
+            }
+        }
         let mut favorites = config.favorites;
         if favorites.is_empty() {
             favorites = vec![
@@ -163,7 +187,8 @@ impl RustFilesApp {
                 places.videos.clone(),
             ];
         }
-        let home = smoke_path.is_none();
+        let home = smoke_path.is_none() && opened.is_none();
+        let tr = crate::i18n::strings(crate::i18n::system_lang());
         let mut app = Self {
             tabs: vec![Tab::at(start.clone(), home)],
             current: 0,
@@ -198,9 +223,20 @@ impl RustFilesApp {
             preview_note: String::new(),
             thumbs: HashMap::new(),
             icons_tex: HashMap::new(),
-            icon_miss: HashSet::new(),
             thumb_asked: HashSet::new(),
+            icon_asked: HashSet::new(),
+            icon_px: HashMap::new(),
+            icon_tx,
             mica_applied: false,
+            tr,
+            open_fav: true,
+            open_drives: true,
+            open_cloud: false,
+            open_network: false,
+            open_wsl: false,
+            open_tags: false,
+            new_menu: false,
+            settings_menu: false,
             cache: HashMap::new(),
             req: 1,
             smoke: smoke_path.map(|path| Smoke {
@@ -216,6 +252,9 @@ impl RustFilesApp {
         }
         if !home {
             app.request_list();
+        }
+        if let Some(file) = select_file {
+            app.tabs[0].selected = vec![file];
         }
         app
     }
@@ -344,7 +383,39 @@ impl RustFilesApp {
                     ),
                 );
             }
-            Event::Error(message) => self.status = message,
+            Event::ShellImage {
+                path,
+                px,
+                width,
+                height,
+                rgba,
+            } => {
+                if width == 0 || rgba.is_empty() {
+                    self.icon_asked.insert((path, px));
+                    return;
+                }
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                let have = self.icon_px.get(&path).copied().unwrap_or(0);
+                if px >= have {
+                    self.icons_tex.insert(
+                        path.clone(),
+                        ctx.load_texture(
+                            format!("{}#{px}", path.display()),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ),
+                    );
+                    self.icon_px.insert(path, px);
+                }
+            }
+            Event::Error(message) => {
+                if !message.contains("access denied") && !message.contains("Cannot open \\\\.\\") {
+                    self.status = message;
+                }
+            }
         }
     }
 
@@ -466,7 +537,8 @@ impl RustFilesApp {
             }
             Action::NewFolder => {
                 let dest = self.tab().path.clone();
-                let _ = self.commands.send(Command::NewFolder { dest });
+                let name = self.tr.new_folder_name.to_string();
+                let _ = self.commands.send(Command::NewFolder { dest, name });
             }
             Action::TogglePreview => self.show_preview = !self.show_preview,
             Action::Analyzer => {
@@ -669,6 +741,20 @@ impl RustFilesApp {
         self.preview_selected();
     }
 
+    pub fn request_icon(&mut self, path: &std::path::Path, px: u32) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        let have = self.icon_px.get(path).copied().unwrap_or(0);
+        if have >= px || !self.icon_asked.insert((path.to_path_buf(), px)) {
+            return;
+        }
+        let _ = self.icon_tx.send(worker::IconJob {
+            path: path.to_path_buf(),
+            px,
+        });
+    }
+
     pub fn preview_selected(&mut self) {
         if self.tab().selected.len() == 1 {
             let path = self.tab().selected[0].clone();
@@ -771,13 +857,19 @@ fn install_fonts(ctx: &Context) {
         .or_default()
         .push("fluent".into());
     #[cfg(windows)]
-    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-        fonts.font_data.insert(
-            "segoe".into(),
-            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            proportional.insert(0, "segoe".into());
+    for file in [
+        r"C:\Windows\Fonts\SegUIVar.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(file) {
+            fonts.font_data.insert(
+                "segoe".into(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                proportional.insert(0, "segoe".into());
+            }
+            break;
         }
     }
     ctx.set_fonts(fonts);
@@ -789,9 +881,22 @@ pub fn apply_theme(ctx: &Context, dark: bool) {
     } else {
         egui::Visuals::light()
     };
-    visuals.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 112, 203);
     visuals.window_corner_radius = egui::CornerRadius::same(8);
     ctx.set_visuals(visuals);
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        ctx.style_mut_of(theme, |style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        });
+    }
 }
 
 fn load_config() -> Config {

@@ -15,12 +15,12 @@ use crate::platform::{self, Places};
 use crate::theme::{self, FilesPalette};
 use crate::worker::Command;
 
-const TITLE_H: f32 = 40.0;
-const NAV_H: f32 = 44.0;
-const COMMAND_H: f32 = 40.0;
-const STATUS_H: f32 = 28.0;
-const SIDE_W: f32 = 252.0;
-const PREVIEW_W: f32 = 280.0;
+const TITLE_H: f32 = 48.0;
+const NAV_H: f32 = 48.0;
+const COMMAND_H: f32 = 48.0;
+const STATUS_H: f32 = 32.0;
+const SIDE_W: f32 = 292.0;
+const PREVIEW_W: f32 = 300.0;
 
 impl RustFilesApp {
     pub fn draw(&mut self, ui: &mut Ui) {
@@ -63,10 +63,20 @@ impl RustFilesApp {
             pos2(body.right() - preview_w, body.bottom()),
         );
         let preview = Rect::from_min_max(pos2(content.right(), body.top()), body.right_bottom());
+        let side_fill = if self.mica_applied {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 72)
+        } else {
+            palette.sidebar
+        };
+        let file_fill = if self.mica_applied {
+            Color32::TRANSPARENT
+        } else {
+            palette.file_area
+        };
         ui.painter()
-            .rect_filled(side, CornerRadius::ZERO, palette.sidebar);
+            .rect_filled(side, CornerRadius::ZERO, side_fill);
         ui.painter()
-            .rect_filled(content, CornerRadius::ZERO, palette.file_area);
+            .rect_filled(content, CornerRadius::ZERO, file_fill);
         if preview_w > 0.0 {
             ui.painter()
                 .rect_filled(preview, CornerRadius::ZERO, palette.sidebar);
@@ -114,16 +124,39 @@ impl RustFilesApp {
         child.add_space(8.0);
         let mut select = None;
         let mut close = None;
+        let mut icon_paths = Vec::new();
         for (index, tab) in self.tabs.iter().enumerate() {
-            let title = tab_title(tab);
-            let (response, close_hit) =
-                tab_chip(&mut child, &title, index == self.current, palette);
+            let title = tab_title(tab, &self.tr);
+            let icon = if tab.home {
+                None
+            } else {
+                self.icons_tex.get(&tab.path).cloned()
+            };
+            let path = if tab.home {
+                None
+            } else {
+                Some(tab.path.clone())
+            };
+            let (response, close_hit) = tab_chip(
+                &mut child,
+                &title,
+                index == self.current,
+                palette,
+                icon.as_ref(),
+                if tab.home { icons::HOME } else { icons::FOLDER },
+            );
+            if let Some(path) = path {
+                icon_paths.push(path);
+            }
             if response.clicked() {
                 select = Some(index);
             }
             if close_hit {
                 close = Some(index);
             }
+        }
+        for path in icon_paths {
+            self.request_icon(&path, 32);
         }
         if chip_button(&mut child, icons::ADD, palette).clicked() {
             self.new_tab_from_home();
@@ -236,9 +269,9 @@ impl RustFilesApp {
             self.perform(Action::Refresh);
         }
         bar.add_space(6.0);
-        let search_w = 220.0;
-        let address_w = (bar.available_width() - search_w - 16.0).max(160.0);
-        let (address, _) = bar.allocate_exact_size(Vec2::new(address_w, 32.0), Sense::hover());
+        let search_w = 240.0;
+        let address_w = (bar.available_width() - search_w - 16.0).max(180.0);
+        let (address, _) = bar.allocate_exact_size(Vec2::new(address_w, 36.0), Sense::hover());
         bar.painter().rect(
             address,
             CornerRadius::same(4),
@@ -269,24 +302,20 @@ impl RustFilesApp {
                     .max_rect(address.shrink2(Vec2::new(10.0, 0.0)))
                     .layout(Layout::left_to_right(Align::Center)),
             );
-            if self.tab().home {
-                crumbs.label(RichText::new("Home").color(palette.text));
-            } else {
+            if crumb_chip(&mut crumbs, Some(icons::HOME), self.tr.home, palette).clicked() {
+                self.show_home();
+            }
+            if !self.tab().home {
                 let parts = nav::breadcrumbs(&self.tab().path);
-                for (index, (label, path)) in parts.iter().enumerate() {
-                    if crumbs
-                        .link(RichText::new(label).color(palette.text).size(13.0))
-                        .clicked()
-                    {
+                for (label, path) in &parts {
+                    crumbs.label(
+                        RichText::new(icons::glyph(icons::CHEVRON_RIGHT))
+                            .font(icon_font(12.0))
+                            .color(palette.text_secondary),
+                    );
+                    if crumb_chip(&mut crumbs, None, label, palette).clicked() {
                         self.navigate(path.clone());
                         return;
-                    }
-                    if index + 1 != parts.len() {
-                        crumbs.label(
-                            RichText::new(icons::glyph(icons::CHEVRON_RIGHT))
-                                .font(icon_font(10.0))
-                                .color(palette.text_secondary),
-                        );
                     }
                 }
             }
@@ -298,7 +327,7 @@ impl RustFilesApp {
             }
         }
         bar.add_space(8.0);
-        let (search, _) = bar.allocate_exact_size(Vec2::new(search_w, 32.0), Sense::hover());
+        let (search, _) = bar.allocate_exact_size(Vec2::new(search_w, 36.0), Sense::hover());
         bar.painter().rect(
             search,
             CornerRadius::same(16),
@@ -319,7 +348,7 @@ impl RustFilesApp {
         let mut query = self.tab().search.clone();
         let response = search_ui.add(
             egui::TextEdit::singleline(&mut query)
-                .hint_text("Search")
+                .hint_text(self.tr.search)
                 .desired_width(search_w - 44.0)
                 .frame(egui::Frame::NONE),
         );
@@ -341,34 +370,39 @@ impl RustFilesApp {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         bar.add_space(8.0);
-        for (glyph, label, action) in [
-            (icons::ADD, "New", Action::NewFolder),
-            (icons::CUT, "Cut", Action::Cut),
-            (icons::COPY, "Copy", Action::Copy),
-            (icons::PASTE, "Paste", Action::Paste),
-            (icons::RENAME, "Rename", Action::Rename),
-            (icons::DELETE, "Delete", Action::Trash),
-        ] {
-            if command_button(&mut bar, glyph, label, palette).clicked() {
-                self.perform(action);
-            }
+        let new_button = command_button(&mut bar, icons::ADD, self.tr.new, palette);
+        if new_button.clicked() {
+            self.new_menu = !self.new_menu;
         }
-        if command_button(&mut bar, icons::SHARE, "Share", palette).clicked() {
-            self.status = "Sharing is not available in this version.".into();
+        let new_pos = new_button.rect.left_bottom();
+        for (glyph, action) in [
+            (icons::CUT, Action::Cut),
+            (icons::COPY, Action::Copy),
+            (icons::PASTE, Action::Paste),
+            (icons::RENAME, Action::Rename),
+            (icons::SHARE, Action::Help),
+            (icons::DELETE, Action::Trash),
+        ] {
+            if icon_button(&mut bar, glyph, palette).clicked() {
+                if glyph == icons::SHARE {
+                    self.status = self.tr.share_unavailable.into();
+                } else {
+                    self.perform(action);
+                }
+            }
         }
         bar.with_layout(Layout::right_to_left(Align::Center), |bar| {
             bar.add_space(8.0);
-            if command_button(
+            if icon_button(bar, icons::DOCUMENT, palette).clicked() {
+                self.show_preview = !self.show_preview;
+                self.save_config();
+            }
+            if icon_button(
                 bar,
                 if self.tab().details {
                     icons::GRID
                 } else {
                     icons::LIST
-                },
-                if self.tab().details {
-                    "Icons"
-                } else {
-                    "Details"
                 },
                 palette,
             )
@@ -376,7 +410,7 @@ impl RustFilesApp {
             {
                 self.tab_mut().details = !self.tab().details;
             }
-            if command_button(bar, icons::SORT, "Sort", palette).clicked() {
+            if icon_button(bar, icons::SORT, palette).clicked() {
                 let tab = self.tab_mut();
                 tab.sort = match tab.sort {
                     SortColumn::Name => SortColumn::Modified,
@@ -386,91 +420,169 @@ impl RustFilesApp {
                 };
                 self.sort_visible();
             }
-            if command_button(bar, icons::INFO, "Analyze", palette).clicked() {
+            if icon_button(bar, icons::INFO, palette).clicked() {
                 self.perform(Action::Analyzer);
             }
         });
+        if self.new_menu {
+            egui::Area::new(egui::Id::unique("new-menu"))
+                .fixed_pos(new_pos)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        if ui.button(self.tr.folder).clicked() {
+                            self.new_menu = false;
+                            self.perform(Action::NewFolder);
+                        }
+                        if ui.button(self.tr.text_file).clicked() {
+                            self.new_menu = false;
+                            let dest = self.tab().path.clone();
+                            let name = self.tr.new_file_name.to_string();
+                            let _ = self.commands.send(Command::NewFile { dest, name });
+                        }
+                    });
+                });
+        }
     }
 
     fn draw_sidebar(&mut self, ui: &mut Ui, rect: Rect, palette: FilesPalette) {
-        let mut side = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(Vec2::new(6.0, 4.0))));
+        let settings_h = 44.0;
+        let scroll_rect =
+            Rect::from_min_max(rect.min, pos2(rect.right(), rect.bottom() - settings_h));
+        let settings_rect =
+            Rect::from_min_max(pos2(rect.left(), scroll_rect.bottom()), rect.right_bottom());
+        let mut side =
+            ui.new_child(UiBuilder::new().max_rect(scroll_rect.shrink2(Vec2::new(8.0, 6.0))));
         ScrollArea::vertical()
             .id_salt("sidebar")
             .show(&mut side, |side| {
-                section(side, palette);
-                if nav_row(side, icons::HOME, "Home", self.tab().home, palette).clicked() {
+                if nav_row(side, icons::HOME, self.tr.home, self.tab().home, palette).clicked() {
                     self.show_home();
                 }
-                section_title(side, "Favorites", palette);
                 let places = self.places.clone();
-                for (glyph, label, path) in favorite_rows(&places) {
-                    if nav_row(
-                        side,
-                        glyph,
-                        label,
-                        !self.tab().home && self.tab().path == path,
-                        palette,
-                    )
-                    .clicked()
+                let favorites = [
+                    (icons::DESKTOP, self.tr.desktop, places.desktop.clone()),
+                    (
+                        icons::ARROW_DOWNLOAD,
+                        self.tr.downloads,
+                        places.downloads.clone(),
+                    ),
+                    (icons::DOCUMENT, self.tr.documents, places.documents.clone()),
+                    (icons::IMAGE, self.tr.pictures, places.pictures.clone()),
+                    (icons::MUSIC, self.tr.music, places.music.clone()),
+                    (icons::VIDEO, self.tr.videos, places.videos.clone()),
+                ];
+                if section_header(side, self.tr.favorites, &mut self.open_fav, palette) {
+                    for (glyph, label, path) in favorites {
+                        if nav_entry(side, self, Some(&path), glyph, label, palette).clicked() {
+                            self.navigate(path);
+                        }
+                    }
+                    if nav_row(side, icons::PIN, self.tr.pin, false, palette).clicked()
+                        && !self.tab().home
                     {
-                        self.navigate(path);
+                        let path = self.tab().path.clone();
+                        if !self.favorites.iter().any(|have| have == &path) {
+                            self.favorites.push(path);
+                            self.save_config();
+                        }
+                    }
+                    for path in self.favorites.clone() {
+                        if places_contains(&places, &path) {
+                            continue;
+                        }
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        if nav_entry(side, self, Some(&path), icons::STAR, &name, palette).clicked()
+                        {
+                            self.navigate(path);
+                        }
                     }
                 }
-                if nav_row(side, icons::PIN, "Pin current folder", false, palette).clicked()
-                    && !self.tab().home
+                if section_header(side, self.tr.drives, &mut self.open_drives, palette) {
+                    for volume in self.volumes.clone() {
+                        let label = if volume.label.is_empty() {
+                            volume.mount.clone()
+                        } else {
+                            volume.label.clone()
+                        };
+                        let mount = PathBuf::from(&volume.mount);
+                        if nav_entry(side, self, Some(&mount), icons::HARD_DRIVE, &label, palette)
+                            .clicked()
+                        {
+                            self.navigate(mount);
+                        }
+                    }
+                }
+                if section_header(side, self.tr.cloud, &mut self.open_cloud, palette)
+                    && nav_row(side, icons::GLOBE, self.tr.cloud, false, palette).clicked()
                 {
-                    let path = self.tab().path.clone();
-                    if !self.favorites.iter().any(|have| have == &path) {
-                        self.favorites.push(path);
-                        self.save_config();
-                    }
+                    self.status = self.tr.cloud_unavailable.into();
                 }
-                for path in self.favorites.clone() {
-                    if places_contains(&places, &path) {
-                        continue;
-                    }
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
-                    if nav_row(side, icons::STAR, &name, self.tab().path == path, palette).clicked()
-                    {
-                        self.navigate(path);
-                    }
+                if section_header(side, self.tr.network, &mut self.open_network, palette)
+                    && nav_row(side, icons::GLOBE, self.tr.network, false, palette).clicked()
+                {
+                    self.status = self.tr.network_unavailable.into();
                 }
-                section_title(side, "Drives", palette);
-                for volume in self.volumes.clone() {
-                    let (total, free) =
-                        platform::disk_usage(std::path::Path::new(&volume.mount)).unwrap_or((0, 0));
-                    let label = if volume.label.is_empty() {
-                        volume.mount.clone()
-                    } else {
-                        volume.label.clone()
-                    };
-                    if drive_row(
-                        side,
-                        &label,
-                        &volume.mount,
-                        total.saturating_sub(free),
-                        total,
-                        palette,
-                    )
-                    .clicked()
-                    {
-                        self.navigate(PathBuf::from(volume.mount));
-                    }
+                if section_header(side, self.tr.wsl, &mut self.open_wsl, palette)
+                    && nav_row(side, icons::DESKTOP, self.tr.wsl, false, palette).clicked()
+                {
+                    self.status = self.tr.wsl_unavailable.into();
                 }
-                section(side, palette);
-                if nav_row(side, icons::GLOBE, "Network", false, palette).clicked() {
-                    self.status = "Network locations are not available in this version.".into();
+                if section_header(side, self.tr.tags, &mut self.open_tags, palette)
+                    && nav_row(side, icons::TAG, self.tr.tags, false, palette).clicked()
+                {
+                    self.status = self.tr.tags_unavailable.into();
                 }
-                if nav_row(side, icons::TAG, "Tags", false, palette).clicked() {
-                    self.status = "Tags are not available in this version.".into();
-                }
-                if nav_row(side, icons::RECYCLE, "Recycle bin", false, palette).clicked() {
+                if nav_row(side, icons::RECYCLE, self.tr.recycle, false, palette).clicked() {
                     self.open_trash();
                 }
             });
+        let mut settings =
+            ui.new_child(UiBuilder::new().max_rect(settings_rect.shrink2(Vec2::new(8.0, 4.0))));
+        if nav_row(&mut settings, icons::MORE, self.tr.settings, false, palette).clicked() {
+            self.settings_menu = !self.settings_menu;
+        }
+        if self.settings_menu {
+            egui::Area::new(egui::Id::unique("settings-menu"))
+                .fixed_pos(settings_rect.left_top() - Vec2::new(0.0, 120.0))
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        if ui
+                            .button(if self.dark {
+                                self.tr.light
+                            } else {
+                                self.tr.dark
+                            })
+                            .clicked()
+                        {
+                            self.dark = !self.dark;
+                            self.mica_applied = false;
+                            self.save_config();
+                        }
+                        if ui
+                            .button(if self.show_hidden {
+                                self.tr.hide_hidden
+                            } else {
+                                self.tr.show_hidden
+                            })
+                            .clicked()
+                        {
+                            self.show_hidden = !self.show_hidden;
+                            self.save_config();
+                            self.request_list();
+                        }
+                        if ui.button(self.tr.reindex).clicked() {
+                            let _ = self.commands.send(Command::Rescan);
+                            self.indexing = true;
+                            self.settings_menu = false;
+                        }
+                    });
+                });
+        }
     }
 
     fn draw_content(&mut self, ui: &mut Ui, rect: Rect, palette: FilesPalette) {
@@ -501,7 +613,7 @@ impl RustFilesApp {
 
     fn draw_home(&mut self, ui: &mut Ui, palette: FilesPalette) {
         ui.label(
-            RichText::new("Drives")
+            RichText::new(self.tr.drives)
                 .color(palette.text)
                 .strong()
                 .size(18.0),
@@ -527,7 +639,7 @@ impl RustFilesApp {
         });
         ui.add_space(22.0);
         ui.label(
-            RichText::new("Recent")
+            RichText::new(self.tr.recent)
                 .color(palette.text)
                 .strong()
                 .size(18.0),
@@ -535,19 +647,19 @@ impl RustFilesApp {
         ui.add_space(8.0);
         let recent = recent_files(&self.places);
         if recent.is_empty() {
-            ui.label(
-                RichText::new("No recent files in Desktop, Documents, or Downloads.")
-                    .color(palette.text_secondary),
-            );
+            ui.label(RichText::new(self.tr.no_recent).color(palette.text_secondary));
             return;
         }
         for row in recent {
+            self.request_icon(&row.path, 32);
+            let icon = self.icons_tex.get(&row.path).cloned();
             if file_line(
                 ui,
                 icons::type_glyph(row.is_dir, &row.name),
                 &row.name,
                 &format_modified(row.modified),
                 palette,
+                icon.as_ref(),
             )
             .clicked()
             {
@@ -564,26 +676,26 @@ impl RustFilesApp {
         let width = ui.available_width();
         let name_w = (width - 340.0).max(160.0);
         ui.horizontal(|ui| {
-            column_header(ui, "Name", name_w, SortColumn::Name, self, palette);
+            column_header(ui, self.tr.name, name_w, SortColumn::Name, self, palette);
             column_header(
                 ui,
-                "Date modified",
-                150.0,
+                self.tr.modified,
+                170.0,
                 SortColumn::Modified,
                 self,
                 palette,
             );
-            column_header(ui, "Type", 80.0, SortColumn::Type, self, palette);
-            column_header(ui, "Size", 80.0, SortColumn::Size, self, palette);
+            column_header(ui, self.tr.kind, 90.0, SortColumn::Type, self, palette);
+            column_header(ui, self.tr.size, 90.0, SortColumn::Size, self, palette);
         });
         let len = self.visible_rows().len();
         if len == 0 {
             ui.add_space(28.0);
             ui.label(
                 RichText::new(if self.tab().search.is_empty() {
-                    "This folder is empty"
+                    self.tr.empty
                 } else {
-                    "No matching files"
+                    self.tr.no_matches
                 })
                 .color(palette.text_secondary),
             );
@@ -610,7 +722,7 @@ impl RustFilesApp {
                     let path = row.path.clone();
                     let is_dir = row.is_dir;
                     let (rect, response) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
                     if selected || response.hovered() {
                         ui.painter().rect_filled(
                             rect,
@@ -651,10 +763,10 @@ impl RustFilesApp {
     }
 
     fn draw_grid(&mut self, ui: &mut Ui, palette: FilesPalette) {
-        let cols = ((ui.available_width() / 112.0).floor() as usize).max(1);
+        let cols = ((ui.available_width() / 156.0).floor() as usize).max(1);
         let len = self.visible_rows().len();
         if len == 0 {
-            ui.label(RichText::new("This folder is empty").color(palette.text_secondary));
+            ui.label(RichText::new(self.tr.empty).color(palette.text_secondary));
             return;
         }
         let mut clicked = None;
@@ -662,7 +774,7 @@ impl RustFilesApp {
         ScrollArea::vertical()
             .id_salt("icons")
             .auto_shrink([false, false])
-            .show_rows(ui, 108.0, len.div_ceil(cols), |ui, range| {
+            .show_rows(ui, 156.0, len.div_ceil(cols), |ui, range| {
                 for row_index in range {
                     ui.horizontal(|ui| {
                         for col in 0..cols {
@@ -677,7 +789,7 @@ impl RustFilesApp {
                                 (row.path.clone(), row.name.clone(), row.is_dir, selected)
                             };
                             let response =
-                                ui.allocate_response(Vec2::new(104.0, 100.0), Sense::click());
+                                ui.allocate_response(Vec2::new(148.0, 148.0), Sense::click());
                             if selected || response.hovered() {
                                 ui.painter().rect_filled(
                                     response.rect,
@@ -690,12 +802,14 @@ impl RustFilesApp {
                                 );
                             }
                             let glyph = icons::type_glyph(is_dir, &name);
+                            self.request_icon(&path, 128);
+                            self.request_thumb(&path, is_dir);
                             if let Some(texture) =
                                 self.thumbs.get(&path).or_else(|| self.icons_tex.get(&path))
                             {
                                 let image = Rect::from_center_size(
-                                    response.rect.center() - Vec2::new(0.0, 12.0),
-                                    Vec2::new(48.0, 40.0),
+                                    response.rect.center() - Vec2::new(18.0, 0.0),
+                                    Vec2::splat(72.0),
                                 );
                                 ui.painter().image(
                                     texture.id(),
@@ -708,18 +822,27 @@ impl RustFilesApp {
                                     response.rect.center() - Vec2::new(0.0, 14.0),
                                     egui::Align2::CENTER_CENTER,
                                     icons::glyph(glyph),
-                                    icon_font(28.0),
+                                    icon_font(48.0),
                                     palette.accent,
                                 );
-                                self.request_thumb(&path, is_dir);
                             }
+                            let kind = if is_dir { self.tr.folder_kind } else { "" };
                             ui.painter().text(
-                                response.rect.center() + Vec2::new(0.0, 28.0),
+                                response.rect.center() + Vec2::new(0.0, 36.0),
                                 egui::Align2::CENTER_CENTER,
-                                truncate(&name, 14),
-                                FontId::proportional(12.0),
+                                truncate(&name, 16),
+                                FontId::proportional(13.0),
                                 palette.text,
                             );
+                            if !kind.is_empty() {
+                                ui.painter().text(
+                                    response.rect.center() + Vec2::new(0.0, 54.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    kind,
+                                    FontId::proportional(12.0),
+                                    palette.text_secondary,
+                                );
+                            }
                             if response.clicked() {
                                 clicked = Some((index, ui.input(|i| i.modifiers)));
                             }
@@ -742,7 +865,7 @@ impl RustFilesApp {
     fn draw_preview(&mut self, ui: &mut Ui, rect: Rect, palette: FilesPalette) {
         let mut pane = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(Vec2::new(16.0, 12.0))));
         pane.label(
-            RichText::new("Details")
+            RichText::new(self.tr.details_title)
                 .color(palette.text)
                 .strong()
                 .size(16.0),
@@ -752,9 +875,9 @@ impl RustFilesApp {
         if selected.len() != 1 {
             pane.label(
                 RichText::new(if selected.is_empty() {
-                    "Select a file to see its details."
+                    self.tr.select_one
                 } else {
-                    "Multiple items selected."
+                    self.tr.multiple
                 })
                 .color(palette.text_secondary),
             );
@@ -869,6 +992,7 @@ impl RustFilesApp {
                             &label,
                             "",
                             palette,
+                            None,
                         )
                         .clicked()
                             && row.is_dir
@@ -912,62 +1036,18 @@ impl RustFilesApp {
             self.visible_rows().len()
         };
         bar.label(
-            RichText::new(format!("{count} items"))
+            RichText::new(format!("{count} {}", self.tr.items))
                 .color(palette.text_secondary)
-                .size(12.0),
+                .size(13.0),
         );
         let selected = self.tab().selected.len();
         if selected > 0 {
             bar.label(
-                RichText::new(format!("   {selected} selected"))
+                RichText::new(format!("   {selected} {}", self.tr.selected))
                     .color(palette.text_secondary)
-                    .size(12.0),
+                    .size(13.0),
             );
         }
-        bar.with_layout(Layout::right_to_left(Align::Center), |bar| {
-            bar.add_space(8.0);
-            if text_button(bar, if self.dark { "Light" } else { "Dark" }, palette).clicked() {
-                self.dark = !self.dark;
-                self.save_config();
-            }
-            if text_button(bar, "Reindex", palette).clicked() {
-                let _ = self.commands.send(Command::Rescan);
-                self.indexing = true;
-                self.status = "Rebuilding the filename index".into();
-            }
-            if text_button(
-                bar,
-                if self.show_hidden {
-                    "Hide hidden"
-                } else {
-                    "Show hidden"
-                },
-                palette,
-            )
-            .clicked()
-            {
-                self.show_hidden = !self.show_hidden;
-                self.save_config();
-                self.request_list();
-            }
-            if self.indexing {
-                let indexed = self
-                    .progress
-                    .files
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(self.indexed);
-                bar.label(
-                    RichText::new(format!("Indexing {indexed}"))
-                        .color(palette.text_secondary)
-                        .size(12.0),
-                );
-            }
-            bar.label(
-                RichText::new(format!("{}   ", self.status))
-                    .color(palette.text_secondary)
-                    .size(12.0),
-            );
-        });
     }
 
     fn draw_dialogs(&mut self, ui: &mut Ui) {
@@ -1103,9 +1183,9 @@ impl RustFilesApp {
     }
 }
 
-fn tab_title(tab: &crate::app::Tab) -> String {
+fn tab_title(tab: &crate::app::Tab, tr: &crate::i18n::Strings) -> String {
     if tab.home {
-        return "Home".into();
+        return tr.home.to_string();
     }
     tab.path
         .file_name()
@@ -1118,9 +1198,11 @@ fn tab_chip(
     title: &str,
     selected: bool,
     palette: FilesPalette,
+    icon: Option<&egui::TextureHandle>,
+    fallback: u32,
 ) -> (egui::Response, bool) {
-    let width = (title.chars().count() as f32 * 7.2 + 46.0).clamp(96.0, 180.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
+    let width = (title.chars().count() as f32 * 8.0 + 64.0).clamp(140.0, 220.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::click());
     let fill = if selected {
         palette.tab_selected
     } else if response.hovered() {
@@ -1128,12 +1210,40 @@ fn tab_chip(
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+    let radius = if selected {
+        CornerRadius {
+            nw: 8,
+            ne: 8,
+            sw: 0,
+            se: 0,
+        }
+    } else {
+        CornerRadius::same(8)
+    };
+    ui.painter().rect_filled(rect, radius, fill);
+    let icon_rect =
+        Rect::from_center_size(rect.left_center() + Vec2::new(18.0, 0.0), Vec2::splat(20.0));
+    if let Some(texture) = icon {
+        ui.painter().image(
+            texture.id(),
+            icon_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(fallback),
+            icon_font(18.0),
+            palette.accent,
+        );
+    }
     ui.painter().text(
-        rect.left_center() + Vec2::new(12.0, 0.0),
+        rect.left_center() + Vec2::new(36.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        truncate(title, 18),
-        FontId::proportional(13.0),
+        truncate(title, 22),
+        FontId::proportional(14.0),
         palette.text,
     );
     let close = Rect::from_center_size(
@@ -1211,6 +1321,7 @@ fn command_button(ui: &mut Ui, glyph: u32, label: &str, palette: FilesPalette) -
     ui.add_space(2.0);
     response
 }
+#[allow(dead_code)]
 fn text_button(ui: &mut Ui, label: &str, palette: FilesPalette) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(label.len() as f32 * 7.0 + 16.0, 22.0),
@@ -1229,9 +1340,145 @@ fn text_button(ui: &mut Ui, label: &str, palette: FilesPalette) -> egui::Respons
     );
     response
 }
+fn icon_button(ui: &mut Ui, glyph: u32, palette: FilesPalette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), palette.hover);
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        icons::glyph(glyph),
+        icon_font(18.0),
+        palette.text,
+    );
+    ui.add_space(2.0);
+    response
+}
+
+fn crumb_chip(
+    ui: &mut Ui,
+    glyph: Option<u32>,
+    label: &str,
+    palette: FilesPalette,
+) -> egui::Response {
+    let width =
+        16.0 + label.chars().count() as f32 * 7.6 + if glyph.is_some() { 22.0 } else { 0.0 };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width.max(28.0), 28.0), Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(4), palette.hover);
+    }
+    let mut x = rect.left() + 6.0;
+    if let Some(glyph) = glyph {
+        ui.painter().text(
+            pos2(x + 8.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(glyph),
+            icon_font(16.0),
+            palette.text,
+        );
+        x += 20.0;
+    }
+    ui.painter().text(
+        pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(14.0),
+        palette.text,
+    );
+    ui.add_space(2.0);
+    response
+}
+
+fn section_header(ui: &mut Ui, title: &str, open: &mut bool, palette: FilesPalette) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    if response.clicked() {
+        *open = !*open;
+    }
+    let glyph = if *open {
+        icons::CHEVRON_DOWN
+    } else {
+        icons::CHEVRON_RIGHT
+    };
+    ui.painter().text(
+        rect.left_center() + Vec2::new(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icons::glyph(glyph),
+        icon_font(12.0),
+        palette.text_secondary,
+    );
+    ui.painter().text(
+        rect.left_center() + Vec2::new(26.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        FontId::proportional(13.0),
+        palette.text_secondary,
+    );
+    *open
+}
+
+fn nav_entry(
+    ui: &mut Ui,
+    app: &mut RustFilesApp,
+    path: Option<&std::path::Path>,
+    glyph: u32,
+    label: &str,
+    palette: FilesPalette,
+) -> egui::Response {
+    let selected = path.is_some_and(|path| !app.tab().home && app.tab().path == path);
+    let texture = path.and_then(|path| app.icons_tex.get(path).cloned());
+    if let Some(path) = path {
+        app.request_icon(path, 32);
+    }
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(4),
+        if selected {
+            palette.selected
+        } else if response.hovered() {
+            palette.hover
+        } else {
+            Color32::TRANSPARENT
+        },
+    );
+    let icon_rect =
+        Rect::from_center_size(rect.left_center() + Vec2::new(18.0, 0.0), Vec2::splat(20.0));
+    if let Some(texture) = texture {
+        ui.painter().image(
+            texture.id(),
+            icon_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(glyph),
+            icon_font(18.0),
+            palette.text,
+        );
+    }
+    ui.painter().text(
+        rect.left_center() + Vec2::new(40.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        truncate(label, 28),
+        FontId::proportional(14.0),
+        palette.text,
+    );
+    response
+}
+
+#[allow(dead_code)]
 fn section(ui: &mut Ui, _palette: FilesPalette) {
     ui.add_space(6.0);
 }
+#[allow(dead_code)]
 fn section_title(ui: &mut Ui, title: &str, palette: FilesPalette) {
     ui.add_space(12.0);
     ui.label(
@@ -1250,7 +1497,7 @@ fn nav_row(
     palette: FilesPalette,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
     ui.painter().rect_filled(
         rect,
         CornerRadius::same(4),
@@ -1266,7 +1513,7 @@ fn nav_row(
         rect.left_center() + Vec2::new(10.0, 0.0),
         egui::Align2::LEFT_CENTER,
         icons::glyph(glyph),
-        icon_font(16.0),
+        icon_font(20.0),
         if selected {
             palette.accent
         } else {
@@ -1274,14 +1521,15 @@ fn nav_row(
         },
     );
     ui.painter().text(
-        rect.left_center() + Vec2::new(36.0, 0.0),
+        rect.left_center() + Vec2::new(40.0, 0.0),
         egui::Align2::LEFT_CENTER,
-        truncate(label, 26),
-        FontId::proportional(13.0),
+        truncate(label, 28),
+        FontId::proportional(14.0),
         palette.text,
     );
     response
 }
+#[allow(dead_code)]
 fn drive_row(
     ui: &mut Ui,
     label: &str,
@@ -1410,25 +1658,37 @@ fn file_line(
     title: &str,
     meta: &str,
     palette: FilesPalette,
+    icon: Option<&egui::TextureHandle>,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::click());
     if response.hovered() {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(4), palette.hover);
     }
-    ui.painter().text(
-        rect.left_center() + Vec2::new(4.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        icons::glyph(glyph),
-        icon_font(16.0),
-        palette.accent,
-    );
+    let icon_rect =
+        Rect::from_center_size(rect.left_center() + Vec2::new(14.0, 0.0), Vec2::splat(20.0));
+    if let Some(texture) = icon {
+        ui.painter().image(
+            texture.id(),
+            icon_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(glyph),
+            icon_font(18.0),
+            palette.accent,
+        );
+    }
     ui.painter().text(
         rect.left_center() + Vec2::new(30.0, 0.0),
         egui::Align2::LEFT_CENTER,
         truncate(title, 48),
-        FontId::proportional(13.0),
+        FontId::proportional(14.0),
         palette.text,
     );
     if !meta.is_empty() {
@@ -1509,8 +1769,10 @@ fn paint_type_icon(
     palette: FilesPalette,
     app: &mut RustFilesApp,
 ) {
+    let _ = is_dir;
+    app.request_icon(path, 32);
     if let Some(texture) = app.icons_tex.get(path) {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
         ui.painter().image(
             texture.id(),
             rect,
@@ -1521,25 +1783,9 @@ fn paint_type_icon(
     }
     ui.label(
         RichText::new(icons::glyph(glyph))
-            .font(icon_font(16.0))
+            .font(icon_font(20.0))
             .color(palette.accent),
     );
-    if app.icon_miss.contains(path) {
-        return;
-    }
-    if let Some((w, h, rgba)) = platform::file_icon_rgba(path, is_dir) {
-        let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-        app.icons_tex.insert(
-            path.to_path_buf(),
-            ui.ctx().load_texture(
-                path.display().to_string(),
-                image,
-                egui::TextureOptions::LINEAR,
-            ),
-        );
-    } else {
-        app.icon_miss.insert(path.to_path_buf());
-    }
 }
 fn paint_treemap(ui: &Ui, rect: Rect, cells: &[crate::worker::MapCell], palette: FilesPalette) {
     for cell in cells {
@@ -1696,16 +1942,6 @@ fn truncate(text: &str, max: usize) -> String {
             text.chars().take(max.saturating_sub(1)).collect::<String>()
         )
     }
-}
-fn favorite_rows(places: &Places) -> Vec<(u32, &'static str, PathBuf)> {
-    vec![
-        (icons::DESKTOP, "Desktop", places.desktop.clone()),
-        (icons::ARROW_DOWNLOAD, "Downloads", places.downloads.clone()),
-        (icons::DOCUMENT, "Documents", places.documents.clone()),
-        (icons::IMAGE, "Pictures", places.pictures.clone()),
-        (icons::MUSIC, "Music", places.music.clone()),
-        (icons::VIDEO, "Videos", places.videos.clone()),
-    ]
 }
 fn places_contains(places: &Places, path: &std::path::Path) -> bool {
     [

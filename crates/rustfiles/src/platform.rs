@@ -147,7 +147,59 @@ pub fn disk_usage(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// System DPI as a scale factor (1.0 = 96 DPI). `None` off Windows.
+pub fn window_scale() -> Option<f32> {
+    #[cfg(windows)]
+    {
+        let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() };
+        if dpi < 96 {
+            None
+        } else {
+            Some(dpi as f32 / 96.0)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Initialize COM on the calling thread so shell thumbnails can be created.
+pub fn init_com() {
+    #[cfg(windows)]
+    {
+        windows::init_com();
+    }
+}
+
+/// Extend the window frame and ask Windows 11 for Mica Alt (the Files backdrop).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn enable_window_backdrop(hwnd: isize, dark: bool) {
+    #[cfg(windows)]
+    {
+        windows::enable_window_backdrop(hwnd, dark);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd, dark);
+    }
+}
+
+/// Shell icon or thumbnail. `edge` is the requested bitmap size in pixels.
+pub fn shell_image(path: &Path, edge: u32) -> Option<(u32, u32, Vec<u8>)> {
+    #[cfg(windows)]
+    {
+        windows::item_image(path, edge)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = edge;
+        file_icon_rgba(path, path.is_dir())
+    }
+}
+
 /// Small system icon for a path. Windows uses the shell; other platforms use the icon theme.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn file_icon_rgba(path: &Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
     #[cfg(windows)]
     {
@@ -620,9 +672,12 @@ mod windows {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(format!("Cannot open {path} ({})", unsafe {
-                GetLastError()
-            }));
+            let code = unsafe { GetLastError() };
+            // Error 5 is access denied. Callers walk the tree instead of reading the MFT.
+            if code == 5 {
+                return Err("access denied".into());
+            }
+            return Err(format!("Cannot open {path} ({code})"));
         }
         Ok(VolumeHandle(handle))
     }
@@ -774,6 +829,165 @@ mod windows {
             return None;
         }
         // GDI gives BGRA. egui wants RGBA.
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+            if pixel[3] == 0 && (pixel[0] | pixel[1] | pixel[2]) != 0 {
+                pixel[3] = 255;
+            }
+        }
+        Some((width, height, pixels))
+    }
+
+    pub fn init_com() {
+        use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        let _ = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+    }
+
+    pub fn enable_window_backdrop(hwnd: isize, dark: bool) {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TABBEDWINDOW,
+            DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        };
+        use windows_sys::Win32::UI::Controls::MARGINS;
+        let hwnd = hwnd as HWND;
+        unsafe {
+            let dark_mode = u32::from(dark);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &dark_mode as *const u32 as *const _,
+                4,
+            );
+            // Mica Alt, the backdrop Files uses behind its tabbed caption.
+            let backdrop = DWMSBT_TABBEDWINDOW;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE as u32,
+                &backdrop as *const i32 as *const _,
+                4,
+            );
+            let margins = MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        }
+    }
+
+    pub fn item_image(path: &std::path::Path, edge: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let edge = edge.clamp(16, 256);
+        if let Some(image) = factory_image(path, edge) {
+            return Some(image);
+        }
+        shell_icon(path, path.is_dir())
+    }
+
+    fn factory_image(path: &std::path::Path, edge: u32) -> Option<(u32, u32, Vec<u8>)> {
+        use std::mem::size_of;
+        use windows_sys::core::GUID;
+        use windows_sys::Win32::Foundation::SIZE;
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
+        use windows_sys::Win32::UI::Shell::SHCreateItemFromParsingName;
+
+        let wide = wide(&path.display().to_string());
+        // IShellItemImageFactory
+        let iid = GUID {
+            data1: 0xbcc1_8b79,
+            data2: 0xba16,
+            data3: 0x442f,
+            data4: [0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b],
+        };
+        let mut unknown: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = unsafe {
+            SHCreateItemFromParsingName(wide.as_ptr(), std::ptr::null_mut(), &iid, &mut unknown)
+        };
+        if hr < 0 || unknown.is_null() {
+            return None;
+        }
+        let vtbl = unsafe { *(unknown as *mut *mut usize) };
+        type GetImage = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            SIZE,
+            i32,
+            *mut *mut std::ffi::c_void,
+        ) -> i32;
+        type Release = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+        let get_image: GetImage = unsafe { std::mem::transmute(*vtbl.add(3)) };
+        let release: Release = unsafe { std::mem::transmute(*vtbl.add(2)) };
+        let mut bitmap: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SIIGBF_BIGGERSIZEOK: thumbnail when the shell has one, otherwise the icon.
+        let hr = unsafe {
+            get_image(
+                unknown,
+                SIZE {
+                    cx: edge as i32,
+                    cy: edge as i32,
+                },
+                0x1,
+                &mut bitmap,
+            )
+        };
+        unsafe { release(unknown) };
+        if hr < 0 || bitmap.is_null() {
+            return None;
+        }
+        let mut info: BITMAP = unsafe { std::mem::zeroed() };
+        let object = unsafe {
+            GetObjectW(
+                bitmap,
+                size_of::<BITMAP>() as i32,
+                &mut info as *mut BITMAP as *mut _,
+            )
+        };
+        if object == 0 {
+            unsafe { DeleteObject(bitmap) };
+            return None;
+        }
+        let image = hbitmap_rgba(bitmap, info.bmWidth, info.bmHeight.unsigned_abs());
+        unsafe { DeleteObject(bitmap) };
+        image
+    }
+
+    fn hbitmap_rgba(
+        bitmap: *mut std::ffi::c_void,
+        width: i32,
+        height: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetDC, GetDIBits, ReleaseDC, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        let width = width.max(0) as u32;
+        if width == 0 || height == 0 || width > 512 || height > 512 {
+            return None;
+        }
+        let mut header: BITMAPINFOHEADER = unsafe { zeroed() };
+        header.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        header.biWidth = width as i32;
+        header.biHeight = -(height as i32);
+        header.biPlanes = 1;
+        header.biBitCount = 32;
+        header.biCompression = BI_RGB;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let dc = unsafe { GetDC(std::ptr::null_mut()) };
+        let rows = unsafe {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                height,
+                pixels.as_mut_ptr() as *mut _,
+                &mut header as *mut BITMAPINFOHEADER as *mut _,
+                DIB_RGB_COLORS,
+            )
+        };
+        unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+        if rows == 0 {
+            return None;
+        }
         for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
             if pixel[3] == 0 && (pixel[0] | pixel[1] | pixel[2]) != 0 {

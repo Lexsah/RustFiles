@@ -28,7 +28,8 @@ pub use mft::{
 pub use model::FileRow;
 pub use model::{filetime_to_unix, format_size, RawFile, SearchHit, Volume, FILE_ROW_SEP};
 pub use ops::{
-    copy_into, create_folder, delete_to_trash, paste, remove_permanently, rename_path, Clipboard,
+    copy_into, create_directory, create_folder, create_text_file, delete_to_trash, paste,
+    remove_permanently, rename_path, Clipboard,
 };
 pub use sort::{natural_cmp, sort_rows, SortColumn};
 pub use usn::{

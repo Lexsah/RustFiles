@@ -1,6 +1,7 @@
 //! RustFiles — a cross-platform file manager with an Everything-style index.
 
 mod app;
+mod i18n;
 mod icons;
 mod nav;
 mod platform;
@@ -26,6 +27,9 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
         return Ok(());
+    }
+    if let Some(path) = args.iter().find(|arg| !arg.starts_with('-')) {
+        std::env::set_var("RUSTFILES_OPEN", path);
     }
     if let Ok(smoke) = std::env::var("RUSTFILES_SMOKE") {
         // The smoke directory is the whole index, even if a developer shell
@@ -56,6 +60,13 @@ fn main() -> eframe::Result {
 impl eframe::App for app::RustFilesApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         apply_mica(self, frame);
+        if let Some(scale) = platform::window_scale() {
+            let native = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
+            let current = ui.ctx().pixels_per_point();
+            if scale > native + 0.08 && (current - scale).abs() > 0.08 {
+                ui.ctx().set_pixels_per_point(scale);
+            }
+        }
         self.pump(ui.ctx());
         self.keys(ui.ctx());
         self.draw(ui);
@@ -65,6 +76,14 @@ impl eframe::App for app::RustFilesApp {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.mica_applied {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            theme::palette(self.dark).window.to_normalized_gamma_f32()
+        }
+    }
 }
 
 fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame) {
@@ -72,7 +91,11 @@ fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame) {
     if !app.mica_applied {
         use raw_window_handle::HasWindowHandle as _;
         if let Ok(handle) = frame.window_handle() {
-            app.mica_applied = window_vibrancy::apply_mica(handle, Some(app.dark)).is_ok();
+            let mica = window_vibrancy::apply_mica(handle, Some(app.dark)).is_ok();
+            if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
+                platform::enable_window_backdrop(win.hwnd.get(), app.dark);
+            }
+            app.mica_applied = mica;
         }
     }
     #[cfg(not(windows))]

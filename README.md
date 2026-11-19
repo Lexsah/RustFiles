@@ -15,6 +15,10 @@ The window is [egui](https://github.com/emilk/egui) 0.37 on [eframe](https://git
 
 Slint's Fluent style was the other way to get closer to WinUI. It still would not reproduce the Files shell (tab strip, breadcrumb, command bar, drive cards) without a custom design, and it would split the UI into a second language. The indexer, search, and analyzer stay in Rust either way, so 0.2 keeps egui and paints the Files shell directly.
 
+## Features in 0.3
+
+Version 0.3 follows the Files layout more closely: larger Segoe UI Variable text and rows, a Mica Alt backdrop on Windows 11, shell icons and thumbnails loaded off the UI thread, breadcrumb chips, icon command buttons, collapsible sidebar sections, a large icon view, and English or French strings from the OS language. A path on the command line opens that folder. Access-denied MFT reads fall back to a directory walk without putting the raw error in the status bar.
+
 ## Features in 0.2
 
 - Files-style shell: custom title bar with tabs and caption buttons, back / forward / up / refresh, breadcrumb address bar, search box, and a command bar (New, Cut, Copy, Paste, Rename, Delete, Share, Sort, view, Analyze)

@@ -68,9 +68,20 @@ pub fn rename_path(path: &Path, new_name: &str) -> Result<PathBuf> {
 }
 
 pub fn create_folder(dir: &Path) -> Result<PathBuf> {
-    let name = unique_name(dir, "New folder");
+    create_directory(dir, "New folder")
+}
+
+pub fn create_directory(dir: &Path, base: &str) -> Result<PathBuf> {
+    let name = unique_name(dir, base);
     let path = dir.join(name);
     fs::create_dir(&path)?;
+    Ok(path)
+}
+
+pub fn create_text_file(dir: &Path, base: &str) -> Result<PathBuf> {
+    let name = unique_name(dir, base);
+    let path = dir.join(name);
+    fs::write(&path, b"")?;
     Ok(path)
 }
 
@@ -260,6 +271,17 @@ mod tests {
         assert!(written[0].ends_with("move-me.txt"));
         assert!(!file.exists());
         assert_eq!(fs::read(&written[0]).unwrap(), b"z");
+    }
+
+    #[test]
+    fn creates_a_folder_and_a_text_file_with_the_given_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = create_directory(dir.path(), "Nouveau dossier").unwrap();
+        assert!(folder.is_dir());
+        let file = create_text_file(dir.path(), "Nouveau document texte.txt").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"");
+        let again = create_text_file(dir.path(), "Nouveau document texte.txt").unwrap();
+        assert_eq!(again.file_name().unwrap(), "Nouveau document texte (2).txt");
     }
 
     #[test]

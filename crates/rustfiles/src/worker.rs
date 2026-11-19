@@ -52,6 +52,11 @@ pub enum Command {
     },
     NewFolder {
         dest: PathBuf,
+        name: String,
+    },
+    NewFile {
+        dest: PathBuf,
+        name: String,
     },
     Preview {
         path: PathBuf,
@@ -120,7 +125,19 @@ pub enum Event {
         height: u32,
         rgba: Vec<u8>,
     },
+    ShellImage {
+        path: PathBuf,
+        px: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     Error(String),
+}
+
+pub struct IconJob {
+    pub path: PathBuf,
+    pub px: u32,
 }
 
 pub struct Progress {
@@ -133,11 +150,35 @@ pub fn spawn(
     events: Sender<Event>,
     repaint: egui::Context,
     progress: Arc<Progress>,
-) {
+) -> Sender<IconJob> {
+    let (icon_tx, icon_rx) = std::sync::mpsc::channel();
+    let icon_events = events.clone();
+    let icon_repaint = repaint.clone();
+    std::thread::Builder::new()
+        .name("rustfiles-icons".into())
+        .spawn(move || icon_loop(icon_rx, icon_events, icon_repaint))
+        .expect("icon thread");
     std::thread::Builder::new()
         .name("rustfiles-index".into())
         .spawn(move || worker_loop(commands, events, repaint, progress))
         .expect("index thread");
+    icon_tx
+}
+
+fn icon_loop(jobs: Receiver<IconJob>, events: Sender<Event>, repaint: egui::Context) {
+    platform::init_com();
+    while let Ok(job) = jobs.recv() {
+        let image = platform::shell_image(&job.path, job.px);
+        let (width, height, rgba) = image.unwrap_or((0, 0, Vec::new()));
+        let _ = events.send(Event::ShellImage {
+            path: job.path,
+            px: job.px,
+            width,
+            height,
+            rgba,
+        });
+        repaint.request_repaint();
+    }
 }
 
 fn worker_loop(
@@ -273,7 +314,24 @@ fn handle(
         Command::DeletePermanent { paths } => mutate_paths(index, events, &paths, |path| {
             rustfiles_core::remove_permanently(path).map(|_| "Deleted".to_string())
         }),
-        Command::NewFolder { dest } => match rustfiles_core::create_folder(&dest) {
+        Command::NewFolder { dest, name } => match rustfiles_core::create_directory(&dest, &name) {
+            Ok(path) => {
+                if let Some(index) = index.as_mut() {
+                    sync_tree(index, &dest, 0);
+                }
+                let _ = events.send(Event::OpDone {
+                    message: format!(
+                        "Created {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    refresh: dest,
+                });
+            }
+            Err(err) => {
+                let _ = events.send(Event::Error(err.message));
+            }
+        },
+        Command::NewFile { dest, name } => match rustfiles_core::create_text_file(&dest, &name) {
             Ok(path) => {
                 if let Some(index) = index.as_mut() {
                     sync_tree(index, &dest, 0);
@@ -429,15 +487,15 @@ fn scan_volumes(volumes: &[DetectedVolume], progress: &Progress) -> Index {
                 Ok(scan) => {
                     builder.set_journal(id, scan.journal_id, scan.next_usn, METHOD_MFT);
                     if scan.journal_id == 0 {
-                        set_status(
-                            progress,
-                            &format!("Read the MFT for {}. Run as administrator to follow the USN journal.", volume.mount),
-                        );
+                        set_status(progress, "");
                     }
                     scan.files
                 }
                 Err(err) => {
-                    set_status(progress, &format!("{err}. Walking {}", volume.mount));
+                    // Access denied is the normal non-elevated path. Walk quietly.
+                    if err != "access denied" {
+                        set_status(progress, &format!("Indexing {}", volume.mount));
+                    }
                     builder.set_journal(id, 0, 0, rustfiles_core::METHOD_WALK);
                     walk_tree(Path::new(&volume.mount), &progress.files)
                 }
