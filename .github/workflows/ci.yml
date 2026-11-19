@@ -26,10 +26,15 @@ jobs:
       - name: Linux GUI libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev xvfb
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev \
+              libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev \
+              libegl1-mesa-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+              libxcb-xfixes0-dev libxcursor-dev libxi-dev xvfb && exit 0
+            echo "apt attempt ${attempt} failed; retrying"
+            sleep $((attempt * 5))
+          done
+          exit 1
       - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --workspace
@@ -50,8 +55,9 @@ jobs:
           $env:RUSTFILES_INDEX_PATHS = $data
           $env:RUSTFILES_TOUR = $shots
           $env:RUSTFILES_SIZE = "1400x900"
-          $proc = Start-Process -FilePath "target\debug\rustfiles.exe" -PassThru -NoNewWindow
-          if (-not $proc.WaitForExit(30000)) { Stop-Process -Id $proc.Id -Force }
+          $log = Join-Path $shots "launch.txt"
+          & "target\debug\rustfiles.exe" *> $log
+          Get-Content $log
           Get-ChildItem $shots | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
