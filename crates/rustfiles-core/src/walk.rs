@@ -5,12 +5,13 @@
 
 use std::fs::{self, Metadata};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::flags::{self, DIRECTORY, HIDDEN};
 use crate::model::{FileRow, RawFile};
@@ -29,6 +30,26 @@ fn walker_pool() -> &'static rayon::ThreadPool {
 }
 
 static WALK_HOOK: std::sync::Mutex<Option<fn()>> = std::sync::Mutex::new(None);
+
+/// Percent of one core the walk may use. 2 keeps an unelevated volume scan
+/// under the 5% budget once UI repaints are also capped.
+static WALK_DUTY_PERCENT: AtomicU32 = AtomicU32::new(2);
+
+/// Sleep long enough that `work` is `percent` of (work + sleep).
+pub fn pace_duration(work: Duration, percent: u32) -> Duration {
+    let percent = percent.clamp(1, 100);
+    if percent >= 100 || work.is_zero() {
+        return Duration::ZERO;
+    }
+    work.saturating_mul(100 - percent) / percent
+}
+
+fn pace(work: Duration) {
+    let sleep = pace_duration(work, WALK_DUTY_PERCENT.load(Ordering::Relaxed));
+    if sleep >= Duration::from_millis(1) {
+        std::thread::sleep(sleep);
+    }
+}
 
 /// Called once on each walk thread. The binary uses this to drop thread priority.
 pub fn set_walk_thread_hook(hook: fn()) {
@@ -79,6 +100,7 @@ fn walk_tree_inner(root: &Path, progress: &AtomicU64, sink: &mut (dyn FnMut(RawF
     progress.fetch_add(1, Ordering::Relaxed);
     let mut level = vec![(root.to_path_buf(), 1u64, true)];
     while !level.is_empty() {
+        let started = std::time::Instant::now();
         let next = Mutex::new(Vec::new());
         level.par_iter().for_each(|(path, parent, top)| {
             let entries = match fs::read_dir(path) {
@@ -123,30 +145,17 @@ fn walk_tree_inner(root: &Path, progress: &AtomicU64, sink: &mut (dyn FnMut(RawF
                     children.push((entry.path(), id, false));
                 }
             }
-            let paced_files = local.len() as u32;
             acc.lock().expect("walk accumulator").append(&mut local);
             next.lock().expect("walk queue").append(&mut children);
-            // Each walk thread yields 2ms per 256 files so a full-disk scan stays
-            // off the UI thread and under about one core.
-            std::thread_local! {
-                static PACED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-            }
-            PACED.with(|paced| {
-                let next = paced.get().saturating_add(paced_files);
-                let sleeps = next / 256;
-                paced.set(next % 256);
-                if sleeps > 0 {
-                    // About 32 ms of sleep per 256 files keeps an unelevated
-                    // volume walk under a tenth of one core.
-                    std::thread::sleep(std::time::Duration::from_millis(32 * u64::from(sleeps)));
-                }
-            });
         });
         level = next.into_inner().expect("walk queue");
         let mut batch = acc.lock().expect("walk accumulator");
         for file in batch.drain(..) {
             sink(file);
         }
+        // Sleep from the measured cost of this level. A fixed pause per file
+        // still used most of a core when reading NTFS metadata was the slow part.
+        pace(started.elapsed());
     }
 }
 
@@ -270,6 +279,7 @@ mod tests {
             std::os::unix::fs::symlink("sub", root.join("link-sub")).unwrap();
         }
 
+        WALK_DUTY_PERCENT.store(100, Ordering::Relaxed);
         let progress = AtomicU64::new(0);
         let files = walk_tree(root, &progress);
         assert!(progress.load(Ordering::Relaxed) >= 4);
@@ -317,6 +327,7 @@ mod tests {
                 fs::write(folder.join(format!("f-{file}.bin")), vec![0u8; 32]).unwrap();
             }
         }
+        WALK_DUTY_PERCENT.store(100, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let cpu_before = process_cpu_ticks();
         let progress = AtomicU64::new(0);
@@ -364,5 +375,15 @@ mod tests {
 
     fn ticks_per_second() -> u64 {
         100
+    }
+
+    #[test]
+    fn two_percent_duty_stays_under_five_percent_of_a_core() {
+        let work = Duration::from_millis(10);
+        let sleep = pace_duration(work, 2);
+        assert_eq!(sleep, Duration::from_millis(490));
+        let duty = work.as_secs_f64() / (work + sleep).as_secs_f64();
+        assert!(duty < 0.05, "{duty}");
+        assert_eq!(pace_duration(work, 100), Duration::ZERO);
     }
 }

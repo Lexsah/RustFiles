@@ -150,6 +150,14 @@ pub struct RustFilesApp {
     icon_order: VecDeque<PathBuf>,
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub mica_armed: bool,
+    perf_path: Option<PathBuf>,
+    perf_started: Instant,
+    perf_last: Instant,
+    perf_frames: u64,
+    perf_mark: u64,
+    perf_cpu: Vec<(String, u64)>,
     pub lang: crate::i18n::Lang,
     pub tr: crate::i18n::Strings,
     pub open_fav: bool,
@@ -269,6 +277,13 @@ impl RustFilesApp {
             icon_order: VecDeque::new(),
             icon_tx,
             mica_applied: false,
+            mica_armed: false,
+            perf_path: std::env::var("RUSTFILES_PERF").ok().map(PathBuf::from),
+            perf_started: Instant::now(),
+            perf_last: Instant::now(),
+            perf_frames: 0,
+            perf_mark: 0,
+            perf_cpu: platform::thread_cpu_ms(),
             lang,
             tr,
             open_fav: true,
@@ -335,7 +350,12 @@ impl RustFilesApp {
             if heavy {
                 uploads += 1;
                 if uploads >= 4 {
-                    ctx.request_repaint();
+                    let wait = if self.indexing {
+                        std::time::Duration::from_millis(500)
+                    } else {
+                        std::time::Duration::from_millis(32)
+                    };
+                    ctx.request_repaint_after(wait);
                     break;
                 }
             }
@@ -344,6 +364,47 @@ impl RustFilesApp {
             if !status.is_empty() {
                 self.status = status.clone();
             }
+        }
+    }
+
+    pub fn perf_tick(&mut self) {
+        self.perf_frames = self.perf_frames.saturating_add(1);
+        let Some(path) = self.perf_path.clone() else {
+            return;
+        };
+        if self.perf_last.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let elapsed_ms = self.perf_last.elapsed().as_secs_f64() * 1000.0;
+        let frames = self.perf_frames.saturating_sub(self.perf_mark);
+        let hz = frames as f64 / (elapsed_ms / 1000.0);
+        let now = aggregate_cpu(&platform::thread_cpu_ms());
+        let mut lines = format!(
+            "t={:.1}s repaint_hz={hz:.2} indexing={}\n",
+            self.perf_started.elapsed().as_secs_f64(),
+            u8::from(self.indexing)
+        );
+        for (name, ms) in &now {
+            let previous = self
+                .perf_cpu
+                .iter()
+                .find(|(existing, _)| existing == name)
+                .map(|(_, value)| *value)
+                .unwrap_or(0);
+            let delta = ms.saturating_sub(previous);
+            let percent = delta as f64 / elapsed_ms * 100.0;
+            lines.push_str(&format!("  {name} {delta}ms {percent:.1}%\n"));
+        }
+        self.perf_cpu = now;
+        self.perf_last = Instant::now();
+        self.perf_mark = self.perf_frames;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = file.write_all(lines.as_bytes());
         }
     }
 
@@ -1221,6 +1282,18 @@ pub fn apply_theme(ctx: &Context, dark: bool) {
                 .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
         });
     }
+}
+
+fn aggregate_cpu(samples: &[(String, u64)]) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for (name, ms) in samples {
+        if let Some((_, total)) = out.iter_mut().find(|(existing, _)| existing == name) {
+            *total = total.saturating_add(*ms);
+        } else {
+            out.push((name.clone(), *ms));
+        }
+    }
+    out
 }
 
 fn load_config() -> Config {

@@ -30,7 +30,10 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    if let Some(path) = args.iter().find(|arg| !arg.starts_with('-')) {
+    if let Some(path) = take_option(&args, "--perf-report") {
+        std::env::set_var("RUSTFILES_PERF", path);
+    }
+    if let Some(path) = positional(&args) {
         std::env::set_var("RUSTFILES_OPEN", path);
     }
     if let Ok(smoke) = std::env::var("RUSTFILES_SMOKE") {
@@ -69,7 +72,7 @@ fn main() -> eframe::Result {
 
 impl eframe::App for app::RustFilesApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        apply_mica(self, frame);
+        apply_mica(self, frame, ui.ctx());
         if let Some(scale) = platform::window_scale() {
             let native = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
             let current = ui.ctx().pixels_per_point();
@@ -92,10 +95,12 @@ impl eframe::App for app::RustFilesApp {
                 .load(std::sync::atomic::Ordering::Relaxed);
             if files != self.indexed {
                 self.indexed = files;
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(500));
             }
+            // Status text follows the file counter, at 2 Hz and no faster.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
         }
+        self.perf_tick();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -107,23 +112,62 @@ impl eframe::App for app::RustFilesApp {
     }
 }
 
-fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame) {
+fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame, ctx: &egui::Context) {
     #[cfg(windows)]
     if !app.mica_applied {
         use raw_window_handle::HasWindowHandle as _;
         if let Ok(handle) = frame.window_handle() {
-            let _ = window_vibrancy::apply_mica(handle, Some(app.dark));
             if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
-                platform::enable_window_backdrop(win.hwnd.get(), app.dark);
-                // Our own DWM call is the backdrop. Stop painting an opaque fill over it.
-                app.mica_applied = true;
+                let hwnd = win.hwnd.get();
+                // DWM ignores the backdrop until the HWND is on screen.
+                if !platform::window_is_visible(hwnd) {
+                    ctx.request_repaint();
+                    return;
+                }
+                if !app.mica_armed {
+                    let _ = platform::enable_window_backdrop(hwnd, app.dark);
+                    app.mica_armed = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                let _ = window_vibrancy::apply_mica(handle, Some(app.dark));
+                if platform::enable_window_backdrop(hwnd, app.dark) {
+                    app.mica_applied = true;
+                    let mut visuals = ctx.global_style().visuals.clone();
+                    visuals.window_fill = egui::Color32::TRANSPARENT;
+                    visuals.panel_fill = egui::Color32::TRANSPARENT;
+                    ctx.set_visuals(visuals);
+                }
             }
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (app, frame);
+        let _ = (app, frame, ctx);
     }
+}
+
+fn take_option(args: &[String], name: &str) -> Option<String> {
+    let index = args.iter().position(|arg| arg == name)?;
+    args.get(index + 1).cloned()
+}
+
+fn positional(args: &[String]) -> Option<&String> {
+    let mut skip_value = false;
+    for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "--perf-report" {
+            skip_value = true;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
 }
 
 fn self_test() -> Result<(), String> {

@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::PathBuf;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::flags::{self, DIRECTORY, TOMBSTONE};
 use crate::model::{FileRow, RawFile, SearchHit, Volume};
@@ -124,18 +124,17 @@ pub struct LiveChild {
 
 pub struct IndexBuilder {
     index: Index,
-    parents: Vec<u64>,
-    ids: FxHashMap<(u16, u64), u32>,
-    seen: FxHashSet<(u16, u64)>,
+    /// `(entry id, parent file reference)` for records whose parent was not
+    /// inserted yet. A directory walk resolves parents immediately and leaves
+    /// this empty, so the build does not keep a second hash map of every file.
+    deferred: Vec<(u32, u64)>,
 }
 
 impl IndexBuilder {
     pub fn new() -> Self {
         Self {
             index: Index::empty(),
-            parents: Vec::new(),
-            ids: FxHashMap::default(),
-            seen: FxHashSet::default(),
+            deferred: Vec::new(),
         }
     }
 
@@ -162,14 +161,23 @@ impl IndexBuilder {
     }
 
     pub fn add_file(&mut self, volume: u16, file: RawFile) {
-        let key = (volume, file.file_ref);
-        if !self.seen.insert(key) {
+        if self.index.lookup_ref(volume, file.file_ref).is_some() {
             return;
         }
         let id = self.index.entries.len() as u32;
-        self.index.push_entry(volume, &file, NO_PARENT);
-        self.parents.push(file.parent_ref);
-        self.ids.insert(key, id);
+        let parent = if file.parent_ref == file.file_ref {
+            NO_PARENT
+        } else {
+            self.index
+                .lookup_ref(volume, file.parent_ref)
+                .filter(|parent| *parent != id)
+                .unwrap_or(NO_PARENT)
+        };
+        if parent == NO_PARENT && file.parent_ref != file.file_ref {
+            self.deferred.push((id, file.parent_ref));
+        }
+        self.index.push_entry(volume, &file, parent);
+        self.index.remember_ref(volume, file.file_ref, id);
         if file.parent_ref == file.file_ref {
             let stored = &mut self.index.volumes[volume as usize];
             if stored.root == NO_PARENT {
@@ -179,26 +187,20 @@ impl IndexBuilder {
     }
 
     pub fn finish(mut self) -> Index {
-        for (index, parent_ref) in self.parents.iter().copied().enumerate() {
-            let file_ref = self.index.entries[index].file_ref;
-            let volume = self.index.entries[index].volume;
-            let resolved = if parent_ref == file_ref {
-                NO_PARENT
-            } else if let Some(&parent) = self.ids.get(&(volume, parent_ref)) {
-                if parent == index as u32 {
-                    NO_PARENT
-                } else {
-                    parent
-                }
-            } else {
-                let root = self.index.volumes[volume as usize].root;
-                if root == index as u32 {
-                    NO_PARENT
-                } else {
-                    root
+        for (id, parent_ref) in self.deferred {
+            let volume = self.index.entries[id as usize].volume;
+            let resolved = match self.index.lookup_ref(volume, parent_ref) {
+                Some(parent) if parent != id => parent,
+                _ => {
+                    let root = self.index.volumes[volume as usize].root;
+                    if root == id {
+                        NO_PARENT
+                    } else {
+                        root
+                    }
                 }
             };
-            self.index.entries[index].parent = resolved;
+            self.index.entries[id as usize].parent = resolved;
         }
         for volume_index in 0..self.index.volumes.len() {
             if self.index.volumes[volume_index].root == NO_PARENT {
@@ -213,6 +215,8 @@ impl IndexBuilder {
             }
         }
         self.index.rebuild_derived();
+        self.index.entries.shrink_to_fit();
+        self.index.names.shrink_to_fit();
         self.index.next_file_ref = self
             .index
             .entries
@@ -787,6 +791,14 @@ impl Index {
         if let Some(list) = self.children.get_mut(&parent) {
             list.retain(|id| *id != child);
         }
+    }
+
+    fn lookup_ref(&self, volume: u16, file_ref: u64) -> Option<u32> {
+        self.refs.get(volume, file_ref)
+    }
+
+    fn remember_ref(&mut self, volume: u16, file_ref: u64, id: u32) {
+        self.refs.insert(volume, file_ref, id);
     }
 
     fn push_entry(&mut self, volume: u16, file: &RawFile, parent: u32) {

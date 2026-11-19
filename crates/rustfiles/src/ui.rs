@@ -27,6 +27,12 @@ impl RustFilesApp {
         if ui.style().visuals.dark_mode != self.dark {
             crate::app::apply_theme(ui.ctx(), self.dark);
         }
+        if self.mica_applied && ui.visuals().window_fill.a() != 0 {
+            let mut visuals = ui.visuals().clone();
+            visuals.window_fill = Color32::TRANSPARENT;
+            visuals.panel_fill = Color32::TRANSPARENT;
+            ui.ctx().set_visuals(visuals);
+        }
         let palette = theme::palette(self.dark);
         let full = ui.max_rect();
         let backdrop = if self.mica_applied {
@@ -64,7 +70,11 @@ impl RustFilesApp {
         );
         let preview = Rect::from_min_max(pos2(content.right(), body.top()), body.right_bottom());
         let side_fill = if self.mica_applied {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 28)
+            if self.dark {
+                Color32::from_rgba_unmultiplied(0, 0, 0, 16)
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 24)
+            }
         } else {
             palette.sidebar
         };
@@ -198,12 +208,14 @@ impl RustFilesApp {
             ),
             (icons::DISMISS, "close"),
         ];
+        let mut hovered = [false; 3];
         for (index, (_glyph, id)) in buttons.iter().enumerate() {
             let button = Rect::from_min_size(
                 pos2(rect.right() - caption_w + index as f32 * 46.0, rect.top()),
                 Vec2::new(46.0, 32.0),
             );
-            let response = ui.interact(button, egui::Id::unique(*id), Sense::click());
+            let response = ui.interact(button, egui::Id::unique(("caption", *id)), Sense::click());
+            hovered[index] = response.hovered();
             let close = *id == "close";
             let hover = ui
                 .ctx()
@@ -216,12 +228,6 @@ impl RustFilesApp {
                 };
                 ui.painter().rect_filled(button, CornerRadius::ZERO, fill);
             }
-            let color = if close && response.hovered() {
-                Color32::WHITE
-            } else {
-                palette.text
-            };
-            paint_caption_glyph(ui, button, id, maximized, color);
             if response.clicked() {
                 let cmd = match *id {
                     "min" => egui::ViewportCommand::Minimized(true),
@@ -230,6 +236,20 @@ impl RustFilesApp {
                 };
                 ui.ctx().send_viewport_cmd(cmd);
             }
+        }
+        // Glyphs are painted after every fill. A 1px dot is feathered away on
+        // the red close hover; the X is a solid stroke instead.
+        for (index, (_glyph, id)) in buttons.iter().enumerate() {
+            let button = Rect::from_min_size(
+                pos2(rect.right() - caption_w + index as f32 * 46.0, rect.top()),
+                Vec2::new(46.0, 32.0),
+            );
+            let color = if *id == "close" && hovered[index] {
+                Color32::WHITE
+            } else {
+                palette.text
+            };
+            paint_caption_glyph(ui, button, id, maximized, color);
         }
     }
 
@@ -1971,25 +1991,22 @@ fn paint_caption_glyph(ui: &Ui, button: Rect, id: &str, maximized: bool, color: 
         }
         "max" => stroke_box(ui, center.x - 5.0, center.y - 5.0, 10.0, color),
         _ => {
-            for step in -4..=4 {
-                let offset = step as f32;
-                fill_px(
-                    ui,
-                    center.x + offset - unit / 2.0,
-                    center.y + offset - unit / 2.0,
-                    unit,
-                    unit,
-                    color,
-                );
-                fill_px(
-                    ui,
-                    center.x + offset - unit / 2.0,
-                    center.y - offset - unit / 2.0,
-                    unit,
-                    unit,
-                    color,
-                );
-            }
+            let half = 5.0;
+            let stroke = Stroke::new(1.6, color);
+            ui.painter().line_segment(
+                [
+                    pos2(center.x - half, center.y - half),
+                    pos2(center.x + half, center.y + half),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    pos2(center.x + half, center.y - half),
+                    pos2(center.x - half, center.y + half),
+                ],
+                stroke,
+            );
         }
     }
 }
