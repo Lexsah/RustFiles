@@ -20,6 +20,15 @@ pub enum Pane {
     Analyzer,
 }
 
+#[derive(Clone)]
+pub struct DeletePrompt {
+    pub paths: Vec<PathBuf>,
+    pub permanent: bool,
+    pub bytes: u64,
+    pub items: u64,
+    pub label: String,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Details,
@@ -123,6 +132,10 @@ pub struct RustFilesApp {
     pub focus_search: bool,
     pub rename: Option<(PathBuf, String)>,
     pub confirm_delete: Vec<PathBuf>,
+    pub delete_prompt: Option<DeletePrompt>,
+    pub analyzer_selected: Option<PathBuf>,
+    pub analyzer_counts: Vec<u64>,
+    pub context_menu: Option<(egui::Pos2, PathBuf)>,
     pub help: bool,
     pub preview_path: PathBuf,
     pub preview_text: String,
@@ -234,6 +247,10 @@ impl RustFilesApp {
             focus_search: false,
             rename: None,
             confirm_delete: Vec::new(),
+            delete_prompt: None,
+            analyzer_selected: None,
+            analyzer_counts: Vec::new(),
+            context_menu: None,
             help: false,
             preview_path: PathBuf::new(),
             preview_text: String::new(),
@@ -303,8 +320,17 @@ impl RustFilesApp {
     }
 
     pub fn pump(&mut self, ctx: &Context) {
+        let mut uploads = 0;
         while let Ok(event) = self.events.try_recv() {
+            let heavy = matches!(event, Event::ShellImage { .. } | Event::Thumb { .. });
             self.on_event(event, ctx);
+            if heavy {
+                uploads += 1;
+                if uploads >= 4 {
+                    ctx.request_repaint();
+                    break;
+                }
+            }
         }
         if let Ok(status) = self.progress.status.try_lock() {
             if !status.is_empty() {
@@ -358,12 +384,13 @@ impl RustFilesApp {
                 total,
                 rows,
                 cells,
-                ..
+                item_counts,
             } => {
                 self.analyzer_path = path;
                 self.analyzer_total = total;
                 self.analyzer_rows = rows;
                 self.analyzer_cells = cells;
+                self.analyzer_counts = item_counts;
                 self.pane = Pane::Analyzer;
             }
             Event::PreviewText { path, text } => {
@@ -398,6 +425,13 @@ impl RustFilesApp {
                 self.status = message;
                 if self.tab().path == refresh {
                     self.request_list();
+                }
+                if self.pane == Pane::Analyzer
+                    && (self.analyzer_path == refresh || self.analyzer_path.starts_with(&refresh))
+                {
+                    self.analyzer_selected = None;
+                    let path = self.analyzer_path.clone();
+                    self.request_analyze(path);
                 }
             }
             Event::Thumb {
@@ -465,7 +499,9 @@ impl RustFilesApp {
                 }
             }
             Event::Error(message) => {
-                if !message.contains("access denied") && !message.contains("Cannot open \\\\.\\") {
+                let scan_noise = message.contains("Cannot open \\\\.\\")
+                    || (message.contains("access denied") && !message.starts_with("Delete failed"));
+                if !scan_noise {
                     self.status = message;
                 }
             }
@@ -529,6 +565,11 @@ impl RustFilesApp {
         self.help = false;
         self.rename = None;
         self.confirm_delete.clear();
+        self.delete_prompt = None;
+        self.context_menu = None;
+        self.layout_menu = false;
+        self.new_menu = false;
+        self.settings_menu = false;
         let tab = self.tab_mut();
         if !tab.search.is_empty() {
             tab.search.clear();
@@ -563,21 +604,20 @@ impl RustFilesApp {
                 self.request_list();
             }
             Action::Rename => self.begin_rename(),
-            Action::Trash => {
-                let paths = self.tab().selected.clone();
-                if !paths.is_empty() {
-                    let _ = self.commands.send(Command::Trash { paths });
-                }
-            }
-            Action::DeletePermanent => {
-                self.confirm_delete = self.tab().selected.clone();
-            }
+            Action::Trash => self.begin_delete(false),
+            Action::DeletePermanent => self.begin_delete(true),
             Action::Copy => self.set_clipboard(false),
             Action::Cut => self.set_clipboard(true),
             Action::Paste => {
                 if let Some(clip) = self.clipboard.clone() {
-                    let dest = self.tab().path.clone();
+                    let dest = if self.pane == Pane::Analyzer {
+                        self.analyzer_path.clone()
+                    } else {
+                        self.tab().path.clone()
+                    };
                     let _ = self.commands.send(Command::Paste { dest, clip });
+                } else {
+                    self.status = self.tr.nothing_to_paste.into();
                 }
             }
             Action::SelectAll => {
@@ -695,9 +735,84 @@ impl RustFilesApp {
         }
     }
 
-    fn set_clipboard(&mut self, cut: bool) {
-        let paths = self.tab().selected.clone();
+    fn selection_paths(&self) -> Vec<PathBuf> {
+        if self.pane == Pane::Analyzer {
+            return self.analyzer_selected.iter().cloned().collect();
+        }
+        self.tab().selected.clone()
+    }
+
+    pub fn begin_delete(&mut self, permanent: bool) {
+        let paths = self.selection_paths();
         if paths.is_empty() {
+            self.status = self.tr.nothing_selected.into();
+            return;
+        }
+        let (bytes, items, label) = self.delete_facts(&paths);
+        self.delete_prompt = Some(DeletePrompt {
+            paths,
+            permanent,
+            bytes,
+            items,
+            label,
+        });
+    }
+
+    fn delete_facts(&self, paths: &[PathBuf]) -> (u64, u64, String) {
+        let mut bytes = 0u64;
+        let mut items = 0u64;
+        let mut label = String::new();
+        for path in paths {
+            if label.is_empty() {
+                label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+            }
+            if let Some((index, _)) = self
+                .analyzer_rows
+                .iter()
+                .enumerate()
+                .find(|(_, row)| row.path == *path)
+            {
+                bytes = bytes.saturating_add(self.analyzer_rows[index].size);
+                items = items.saturating_add(self.analyzer_counts.get(index).copied().unwrap_or(1));
+                continue;
+            }
+            if let Some(row) = self.visible_rows().iter().find(|row| row.path == *path) {
+                bytes = bytes.saturating_add(row.size);
+                items = items.saturating_add(1);
+                continue;
+            }
+            items = items.saturating_add(1);
+        }
+        if paths.len() > 1 {
+            label = format!("{} (+{})", label, paths.len() - 1);
+        }
+        (bytes, items.max(1), label)
+    }
+
+    pub fn commit_delete(&mut self) {
+        let Some(prompt) = self.delete_prompt.take() else {
+            return;
+        };
+        self.status = self.tr.deleting.into();
+        let command = if prompt.permanent {
+            Command::DeletePermanent {
+                paths: prompt.paths,
+            }
+        } else {
+            Command::Trash {
+                paths: prompt.paths,
+            }
+        };
+        let _ = self.commands.send(command);
+    }
+
+    fn set_clipboard(&mut self, cut: bool) {
+        let paths = self.selection_paths();
+        if paths.is_empty() {
+            self.status = self.tr.nothing_selected.into();
             return;
         }
         self.clipboard = Some(Clipboard {
@@ -955,8 +1070,9 @@ fn install_fonts(ctx: &Context) {
         .push("fluent".into());
     #[cfg(windows)]
     for file in [
-        r"C:\Windows\Fonts\SegUIVar.ttf",
         r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\SegUIVar.ttf",
     ] {
         if let Ok(bytes) = std::fs::read(file) {
             fonts.font_data.insert(
@@ -1001,6 +1117,7 @@ pub fn apply_theme(ctx: &Context, dark: bool) {
     ctx.set_visuals(visuals);
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         ctx.style_mut_of(theme, |style| {
+            style.animation_time = 0.12;
             style
                 .text_styles
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));

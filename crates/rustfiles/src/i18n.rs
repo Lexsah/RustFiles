@@ -78,6 +78,14 @@ pub struct Strings {
     pub analyze: &'static str,
     pub sunburst: &'static str,
     pub treemap: &'static str,
+    pub cancel: &'static str,
+    pub move_to_trash: &'static str,
+    pub delete_permanently: &'static str,
+    pub open: &'static str,
+    pub properties: &'static str,
+    pub nothing_selected: &'static str,
+    pub nothing_to_paste: &'static str,
+    pub deleting: &'static str,
 }
 
 pub fn system_lang() -> Lang {
@@ -181,6 +189,14 @@ const EN: Strings = Strings {
     analyze: "Analyze",
     sunburst: "Sunburst",
     treemap: "Treemap",
+    cancel: "Cancel",
+    move_to_trash: "Move to the Recycle Bin",
+    delete_permanently: "Delete permanently",
+    open: "Open",
+    properties: "Properties",
+    nothing_selected: "Select an item first.",
+    nothing_to_paste: "The clipboard is empty.",
+    deleting: "Deleting…",
 };
 
 const FR: Strings = Strings {
@@ -253,4 +269,12 @@ const FR: Strings = Strings {
     analyze: "Analyser",
     sunburst: "Anneau",
     treemap: "Carte",
+    cancel: "Annuler",
+    move_to_trash: "Mettre à la Corbeille",
+    delete_permanently: "Supprimer définitivement",
+    open: "Ouvrir",
+    properties: "Propriétés",
+    nothing_selected: "Sélectionnez un élément.",
+    nothing_to_paste: "Le presse-papiers est vide.",
+    deleting: "Suppression…",
 };

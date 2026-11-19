@@ -393,6 +393,22 @@ impl Index {
         out
     }
 
+    /// Alive entries in the subtree, including `id` itself.
+    pub fn subtree_items(&self, id: u32) -> u64 {
+        let mut stack = vec![id];
+        let mut count = 0u64;
+        while let Some(current) = stack.pop() {
+            if !self.alive(current) {
+                continue;
+            }
+            count += 1;
+            if let Some(children) = self.children.get(&current) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        count
+    }
+
     pub fn list_dir(&mut self, id: u32, show_hidden: bool) -> Vec<FileRow> {
         self.ensure_sizes();
         let children = self.children.get(&id).cloned().unwrap_or_default();
@@ -1326,6 +1342,15 @@ mod tests {
         let index = builder.finish();
         let id = index.find_path("c:/users/readme.md").unwrap();
         assert_eq!(index.path(id), "C:\\Users\\Readme.md");
+    }
+
+    #[test]
+    fn subtree_items_counts_the_folder_and_its_descendants() {
+        let index = sample();
+        let root = index.find_path("/data").unwrap();
+        let notes = index.find_path("/data/Photos/notes.txt").unwrap();
+        assert_eq!(index.subtree_items(notes), 1);
+        assert!(index.subtree_items(root) >= 4);
     }
 
     #[test]

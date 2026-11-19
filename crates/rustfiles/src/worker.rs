@@ -100,6 +100,8 @@ pub enum Event {
         total: u64,
         rows: Vec<FileRow>,
         cells: Vec<MapCell>,
+        /// One count per row: alive entries in that subtree, including the row.
+        item_counts: Vec<u64>,
     },
     PreviewText {
         path: PathBuf,
@@ -651,12 +653,22 @@ fn analyze(index: &mut Option<Index>, events: &Sender<Event>, path: PathBuf, req
             }
         })
         .collect();
+    let item_counts: Vec<u64> = rows
+        .iter()
+        .map(|row| {
+            index
+                .find_path(&row.path.display().to_string())
+                .map(|child| index.subtree_items(child))
+                .unwrap_or(1)
+        })
+        .collect();
     let _ = req;
     let _ = events.send(Event::AnalyzeResult {
         path,
         total,
         rows,
         cells,
+        item_counts,
     });
 }
 
@@ -742,6 +754,7 @@ fn mutate_paths(
 ) {
     let mut refresh = None;
     let mut message = String::new();
+    let mut errors = Vec::new();
     for path in paths {
         match op(path) {
             Ok(text) => {
@@ -749,10 +762,19 @@ fn mutate_paths(
                 refresh = path.parent().map(Path::to_path_buf);
             }
             Err(err) => {
-                let _ = events.send(Event::Error(err.message));
-                return;
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                errors.push(format!("{name}: {}", err.message));
             }
         }
+    }
+    if !errors.is_empty() {
+        let _ = events.send(Event::Error(format!(
+            "Delete failed: {}",
+            errors.join("; ")
+        )));
     }
     if let (Some(index), Some(dir)) = (index.as_mut(), refresh.clone()) {
         sync_tree(index, &dir, 0);

@@ -1,6 +1,7 @@
 //! RustFiles — a cross-platform file manager with an Everything-style index.
 
 mod app;
+mod controls;
 mod i18n;
 mod icons;
 mod layout;
@@ -164,7 +165,14 @@ fn self_test() -> Result<(), String> {
     if loaded.search("needle", 5).is_empty() {
         return Err("reloaded index could not search".into());
     }
+    controls::exercise(&dir).map_err(|err| format!("command exercise: {err}"))?;
     let _ = fs::remove_dir_all(&dir);
+    for control in controls::catalog() {
+        println!(
+            "control {} / {} — {}",
+            control.surface, control.name, control.behavior
+        );
+    }
     println!("self-test ok");
     let _ = PathBuf::from(".");
     Ok(())

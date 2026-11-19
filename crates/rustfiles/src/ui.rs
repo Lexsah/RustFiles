@@ -123,7 +123,7 @@ impl RustFilesApp {
     }
 
     fn draw_title(&mut self, ui: &mut Ui, rect: Rect, palette: FilesPalette) {
-        let caption_w = 138.0;
+        let caption_w = 46.0 * 3.0;
         let tabs = Rect::from_min_max(rect.min, pos2(rect.right() - caption_w, rect.bottom()));
         let mut child = ui.new_child(
             UiBuilder::new()
@@ -170,13 +170,12 @@ impl RustFilesApp {
         if chip_button(&mut child, icons::ADD, palette).clicked() {
             self.new_tab_from_home();
         }
-        let drag = child.interact(
-            tabs,
-            egui::Id::unique("title-drag"),
-            Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        let gap = Rect::from_min_max(pos2(child.cursor().left(), tabs.top()), tabs.max);
+        if gap.width() > 8.0 {
+            let drag = child.interact(gap, egui::Id::unique("title-drag"), Sense::click_and_drag());
+            if drag.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
         }
         if let Some(index) = select {
             self.current = index;
@@ -202,34 +201,27 @@ impl RustFilesApp {
         for (index, (_glyph, id)) in buttons.iter().enumerate() {
             let button = Rect::from_min_size(
                 pos2(rect.right() - caption_w + index as f32 * 46.0, rect.top()),
-                Vec2::new(46.0, rect.height()),
+                Vec2::new(46.0, 32.0),
             );
             let response = ui.interact(button, egui::Id::unique(*id), Sense::click());
             let close = *id == "close";
-            if response.hovered() {
-                ui.painter().rect_filled(
-                    button,
-                    CornerRadius::ZERO,
-                    if close {
-                        Color32::from_rgb(196, 43, 28)
-                    } else {
-                        palette.hover
-                    },
-                );
+            let hover = ui
+                .ctx()
+                .animate_bool_with_time(response.id, response.hovered(), 0.1);
+            if hover > 0.01 {
+                let fill = if close {
+                    Color32::from_rgb(196, 43, 28).gamma_multiply(hover)
+                } else {
+                    palette.hover.gamma_multiply(hover)
+                };
+                ui.painter().rect_filled(button, CornerRadius::ZERO, fill);
             }
             let color = if close && response.hovered() {
                 Color32::WHITE
             } else {
                 palette.text
             };
-            let (mark, font) = caption_mark(id, maximized);
-            ui.painter().text(
-                button.center(),
-                egui::Align2::CENTER_CENTER,
-                mark,
-                font,
-                color,
-            );
+            paint_caption_glyph(ui, button, id, maximized, color);
             if response.clicked() {
                 let cmd = match *id {
                     "min" => egui::ViewportCommand::Minimized(true),
@@ -281,7 +273,8 @@ impl RustFilesApp {
         bar.add_space(6.0);
         let search_w = 240.0;
         let address_w = (bar.available_width() - search_w - 16.0).max(180.0);
-        let (address, _) = bar.allocate_exact_size(Vec2::new(address_w, 32.0), Sense::hover());
+        let (address, address_response) =
+            bar.allocate_exact_size(Vec2::new(address_w, 32.0), Sense::click());
         bar.painter().rect(
             address,
             CornerRadius::same(4),
@@ -341,10 +334,7 @@ impl RustFilesApp {
                     previous = Some(path.clone());
                 }
             }
-            if bar
-                .interact(address, egui::Id::unique("address-edit"), Sense::click())
-                .double_clicked()
-            {
+            if address_response.double_clicked() {
                 self.perform(Action::FocusPath);
             }
         }
@@ -398,30 +388,32 @@ impl RustFilesApp {
         }
         let new_pos = new_button.rect.left_bottom();
         bar_separator(&mut bar, palette);
-        for (glyph, tip, action) in [
-            (icons::CUT, self.tr.cut, Action::Cut),
-            (icons::COPY, self.tr.copy, Action::Copy),
-            (icons::PASTE, self.tr.paste, Action::Paste),
-            (icons::RENAME, self.tr.rename, Action::Rename),
-            (icons::SHARE, self.tr.share, Action::Help),
-            (icons::DELETE, self.tr.delete, Action::Trash),
-        ] {
-            if icon_button(&mut bar, glyph, tip, palette).clicked() {
-                if glyph == icons::SHARE {
-                    self.status = self.tr.share_unavailable.into();
-                } else {
-                    self.perform(action);
-                }
+        let has_selection = !self.tab().selected.is_empty();
+        let commands = [
+            (icons::CUT, self.tr.cut, Action::Cut, has_selection),
+            (icons::COPY, self.tr.copy, Action::Copy, has_selection),
+            (
+                icons::PASTE,
+                self.tr.paste,
+                Action::Paste,
+                self.clipboard.is_some(),
+            ),
+            (icons::RENAME, self.tr.rename, Action::Rename, has_selection),
+            (icons::DELETE, self.tr.delete, Action::Trash, has_selection),
+        ];
+        for (glyph, tip, action, enabled) in commands {
+            if icon_button(&mut bar, glyph, tip, palette, enabled).clicked() {
+                self.perform(action);
             }
         }
         let layout_button = bar.with_layout(Layout::right_to_left(Align::Center), |bar| {
             bar.add_space(8.0);
-            if icon_button(bar, icons::DOCUMENT, self.tr.preview, palette).clicked() {
+            if icon_button(bar, icons::DOCUMENT, self.tr.preview, palette, true).clicked() {
                 self.show_preview = !self.show_preview;
                 self.save_config();
             }
             let layout_button = command_button(bar, icons::GRID, self.tr.layout, palette);
-            if icon_button(bar, icons::SORT, self.tr.group, palette).clicked() {
+            if icon_button(bar, icons::SORT, self.tr.group, palette, true).clicked() {
                 let tab = self.tab_mut();
                 tab.sort = match tab.sort {
                     SortColumn::Name => SortColumn::Type,
@@ -429,14 +421,21 @@ impl RustFilesApp {
                     SortColumn::Modified => SortColumn::Size,
                     SortColumn::Size => SortColumn::Name,
                 };
+                let grouped = match tab.sort {
+                    SortColumn::Name => self.tr.name,
+                    SortColumn::Type => self.tr.kind,
+                    SortColumn::Modified => self.tr.modified,
+                    SortColumn::Size => self.tr.size,
+                };
+                self.status = format!("{}: {grouped}", self.tr.group);
                 self.sort_visible();
             }
-            if icon_button(bar, icons::SORT, self.tr.sort, palette).clicked() {
+            if icon_button(bar, icons::SORT, self.tr.sort, palette, true).clicked() {
                 let tab = self.tab_mut();
                 tab.ascending = !tab.ascending;
                 self.sort_visible();
             }
-            if icon_button(bar, icons::INFO, self.tr.analyze, palette).clicked() {
+            if icon_button(bar, icons::INFO, self.tr.analyze, palette, true).clicked() {
                 self.perform(Action::Analyzer);
             }
             layout_button
@@ -444,27 +443,31 @@ impl RustFilesApp {
         if layout_button.inner.clicked() {
             self.layout_menu = !self.layout_menu;
         }
-        if self.layout_menu {
-            let pos = layout_button.inner.rect.left_bottom();
-            egui::Area::new(egui::Id::unique("layout-menu"))
-                .fixed_pos(pos)
-                .order(egui::Order::Foreground)
-                .show(ui.ctx(), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        for (mode, label) in [
-                            (crate::app::ViewMode::Details, self.tr.details),
-                            (crate::app::ViewMode::List, self.tr.list),
-                            (crate::app::ViewMode::Tiles, self.tr.tiles),
-                            (crate::app::ViewMode::Grid, self.tr.grid),
-                            (crate::app::ViewMode::Large, self.tr.large_icons),
-                        ] {
-                            if ui.button(label).clicked() {
-                                self.tab_mut().view = mode;
-                                self.layout_menu = false;
-                            }
-                        }
-                    });
-                });
+        let layout_open = ui.ctx().animate_bool_with_time(
+            egui::Id::unique("layout-flyout"),
+            self.layout_menu,
+            0.14,
+        );
+        if layout_open > 0.02 {
+            let pos = layout_button.inner.rect.left_bottom()
+                + Vec2::new(0.0, 4.0 + (1.0 - layout_open) * 6.0);
+            let modes = [
+                (crate::app::ViewMode::Details, self.tr.details, icons::LIST),
+                (crate::app::ViewMode::List, self.tr.list, icons::LIST),
+                (crate::app::ViewMode::Tiles, self.tr.tiles, icons::GRID),
+                (crate::app::ViewMode::Grid, self.tr.grid, icons::GRID),
+                (
+                    crate::app::ViewMode::Large,
+                    self.tr.large_icons,
+                    icons::IMAGE,
+                ),
+            ];
+            let current = self.tab().view;
+            if let Some(chosen) = flyout(ui.ctx(), pos, layout_open, &modes, Some(current), palette)
+            {
+                self.tab_mut().view = chosen;
+                self.layout_menu = false;
+            }
         }
         if self.new_menu {
             egui::Area::new(egui::Id::unique("new-menu"))
@@ -798,6 +801,7 @@ impl RustFilesApp {
             return;
         }
         let mut clicked = None;
+        let mut context = None;
         let mut opened = None;
         ScrollArea::vertical()
             .id_salt("details")
@@ -846,6 +850,9 @@ impl RustFilesApp {
                     if response.double_clicked() {
                         opened = Some(index);
                     }
+                    if response.secondary_clicked() {
+                        context = Some(index);
+                    }
                 }
             });
         if let Some((index, mods)) = clicked {
@@ -854,6 +861,16 @@ impl RustFilesApp {
         if let Some(index) = opened {
             self.select_row(index, egui::Modifiers::NONE);
             self.open_selection();
+        }
+        if let Some(index) = context {
+            self.select_row(index, egui::Modifiers::NONE);
+            if let Some(path) = self.visible_rows().get(index).map(|row| row.path.clone()) {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    self.context_menu = Some((pos, path));
+                    self.layout_menu = false;
+                    self.new_menu = false;
+                }
+            }
         }
     }
 
@@ -999,6 +1016,7 @@ impl RustFilesApp {
             return;
         }
         let mut clicked = None;
+        let mut context = None;
         let mut opened = None;
         ScrollArea::vertical()
             .id_salt("list")
@@ -1058,6 +1076,9 @@ impl RustFilesApp {
                     if response.double_clicked() {
                         opened = Some(index);
                     }
+                    if response.secondary_clicked() {
+                        context = Some(index);
+                    }
                 }
             });
         if let Some((index, mods)) = clicked {
@@ -1066,6 +1087,16 @@ impl RustFilesApp {
         if let Some(index) = opened {
             self.select_row(index, egui::Modifiers::NONE);
             self.open_selection();
+        }
+        if let Some(index) = context {
+            self.select_row(index, egui::Modifiers::NONE);
+            if let Some(path) = self.visible_rows().get(index).map(|row| row.path.clone()) {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    self.context_menu = Some((pos, path));
+                    self.layout_menu = false;
+                    self.new_menu = false;
+                }
+            }
         }
     }
 
@@ -1077,6 +1108,7 @@ impl RustFilesApp {
         }
         let cols = ((ui.available_width() / 308.0).floor() as usize).max(1);
         let mut clicked = None;
+        let mut context = None;
         let mut opened = None;
         ScrollArea::vertical()
             .id_salt("tiles")
@@ -1189,6 +1221,9 @@ impl RustFilesApp {
                             if response.double_clicked() {
                                 opened = Some(index);
                             }
+                            if response.secondary_clicked() {
+                                context = Some(index);
+                            }
                         }
                     });
                 }
@@ -1199,6 +1234,16 @@ impl RustFilesApp {
         if let Some(index) = opened {
             self.select_row(index, egui::Modifiers::NONE);
             self.open_selection();
+        }
+        if let Some(index) = context {
+            self.select_row(index, egui::Modifiers::NONE);
+            if let Some(path) = self.visible_rows().get(index).map(|row| row.path.clone()) {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    self.context_menu = Some((pos, path));
+                    self.layout_menu = false;
+                    self.new_menu = false;
+                }
+            }
         }
     }
 
@@ -1211,6 +1256,7 @@ impl RustFilesApp {
             return;
         }
         let mut clicked = None;
+        let mut context = None;
         let mut opened = None;
         ScrollArea::vertical()
             .id_salt("icons")
@@ -1313,6 +1359,9 @@ impl RustFilesApp {
                             if response.double_clicked() {
                                 opened = Some(index);
                             }
+                            if response.secondary_clicked() {
+                                context = Some(index);
+                            }
                         }
                     });
                 }
@@ -1323,6 +1372,16 @@ impl RustFilesApp {
         if let Some(index) = opened {
             self.select_row(index, egui::Modifiers::NONE);
             self.open_selection();
+        }
+        if let Some(index) = context {
+            self.select_row(index, egui::Modifiers::NONE);
+            if let Some(path) = self.visible_rows().get(index).map(|row| row.path.clone()) {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    self.context_menu = Some((pos, path));
+                    self.layout_menu = false;
+                    self.new_menu = false;
+                }
+            }
         }
     }
 
@@ -1448,8 +1507,11 @@ impl RustFilesApp {
                     self.request_analyze(parent);
                 }
             }
-            if command_button(ui, icons::FOLDER, "Files", palette).clicked() {
+            if command_button(ui, icons::FOLDER, self.tr.files, palette).clicked() {
                 self.pane = Pane::Files;
+            }
+            if command_button(ui, icons::DELETE, self.tr.delete, palette).clicked() {
+                self.begin_delete(false);
             }
             if command_button(
                 ui,
@@ -1488,18 +1550,26 @@ impl RustFilesApp {
                                 format_size(row.size)
                             }
                         );
-                        if file_line(
+                        let response = file_line(
                             ui,
                             icons::type_glyph(row.is_dir, &row.name),
                             &label,
                             "",
                             palette,
                             None,
-                        )
-                        .clicked()
-                            && row.is_dir
-                        {
+                        );
+                        if response.clicked() {
+                            self.analyzer_selected = Some(row.path.clone());
+                        }
+                        if response.double_clicked() && row.is_dir {
                             self.request_analyze(row.path.clone());
+                        }
+                        if response.secondary_clicked() {
+                            self.analyzer_selected = Some(row.path.clone());
+                            if let Some(pos) = ui.ctx().input(|input| input.pointer.interact_pos())
+                            {
+                                self.context_menu = Some((pos, row.path.clone()));
+                            }
                         }
                     }
                 });
@@ -1511,14 +1581,17 @@ impl RustFilesApp {
             if self.sunburst {
                 paint_sunburst(ui, rect, &cells, palette);
             } else {
-                paint_treemap(ui, rect, &cells, palette);
+                paint_treemap(ui, rect, &cells, palette, self.analyzer_selected.as_deref());
             }
-            if response.clicked() {
-                if let Some(pointer) = response.interact_pointer_pos() {
-                    if let Some(cell) = hit_cell(&cells, rect, pointer, self.sunburst) {
-                        if cell.is_dir {
-                            self.request_analyze(cell.path.clone());
-                        }
+            if let Some(pointer) = response.interact_pointer_pos() {
+                if let Some(cell) = hit_cell(&cells, rect, pointer, self.sunburst) {
+                    if response.secondary_clicked() {
+                        self.analyzer_selected = Some(cell.path.clone());
+                        self.context_menu = Some((pointer, cell.path.clone()));
+                    } else if response.double_clicked() && cell.is_dir {
+                        self.request_analyze(cell.path.clone());
+                    } else if response.clicked() {
+                        self.analyzer_selected = Some(cell.path.clone());
                     }
                 }
             }
@@ -1544,6 +1617,15 @@ impl RustFilesApp {
             FontId::proportional(12.0),
             palette.text_secondary,
         );
+        if !self.status.is_empty() {
+            ui.painter().text(
+                pos2(rect.right() - 12.0, y),
+                egui::Align2::RIGHT_CENTER,
+                truncate(&self.status, 72),
+                FontId::proportional(12.0),
+                palette.text_secondary,
+            );
+        }
     }
 
     fn draw_dialogs(&mut self, ui: &mut Ui) {
@@ -1585,26 +1667,127 @@ impl RustFilesApp {
                 self.rename = None;
             }
         }
-        if !self.confirm_delete.is_empty() {
-            let paths = self.confirm_delete.clone();
-            let mut open = true;
-            let mut confirm = false;
-            egui::Window::new("Delete permanently")
-                .open(&mut open)
-                .show(&ctx, |ui| {
-                    ui.label(format!(
-                        "Delete {} item(s) without using the Recycle Bin?",
-                        paths.len()
-                    ));
-                    if ui.button("Delete").clicked() {
-                        confirm = true;
-                    }
-                });
-            if confirm {
-                let _ = self.commands.send(Command::DeletePermanent { paths });
-                self.confirm_delete.clear();
-            } else if !open {
-                self.confirm_delete.clear();
+        if self.delete_prompt.is_some() {
+            self.paint_delete_dialog(ui);
+        }
+        if let Some((pos, path)) = self.context_menu.clone() {
+            self.paint_context_menu(ui, pos, path);
+        }
+    }
+
+    fn paint_delete_dialog(&mut self, ui: &mut Ui) {
+        let Some(prompt) = self.delete_prompt.clone() else {
+            return;
+        };
+        let palette = theme::palette(self.dark);
+        let size = format_bytes(prompt.bytes, self.lang);
+        let title = if prompt.permanent {
+            self.tr.delete_permanently
+        } else {
+            self.tr.move_to_trash
+        };
+        let body = format!(
+            "{}\n{}\n{} {}",
+            prompt.label, size, prompt.items, self.tr.items
+        );
+        let screen = ui.ctx().content_rect();
+        let dialog = Rect::from_center_size(screen.center(), Vec2::new(420.0, 188.0));
+        let painter = ui.painter();
+        painter.rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(90));
+        painter.rect_filled(dialog, CornerRadius::same(8), palette.card);
+        painter.rect_stroke(
+            dialog,
+            CornerRadius::same(8),
+            Stroke::new(1.0, palette.stroke),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            dialog.left_top() + Vec2::new(20.0, 20.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            FontId::proportional(16.0),
+            palette.text,
+        );
+        painter.text(
+            dialog.left_top() + Vec2::new(20.0, 52.0),
+            egui::Align2::LEFT_TOP,
+            body,
+            FontId::proportional(14.0),
+            palette.text_secondary,
+        );
+        let mut child = ui.new_child(UiBuilder::new().max_rect(dialog));
+        child.add_space(128.0);
+        child.horizontal(|child| {
+            child.add_space(20.0);
+            if command_button(child, icons::DISMISS, self.tr.cancel, palette).clicked() {
+                self.delete_prompt = None;
+            }
+            if command_button(child, icons::DELETE, self.tr.delete, palette).clicked() {
+                self.commit_delete();
+            }
+        });
+    }
+
+    fn paint_context_menu(&mut self, ui: &mut Ui, pos: egui::Pos2, path: PathBuf) {
+        let palette = theme::palette(self.dark);
+        let rows = [
+            (self.tr.open, Action::Open),
+            (self.tr.copy, Action::Copy),
+            (self.tr.cut, Action::Cut),
+            (self.tr.paste, Action::Paste),
+            (self.tr.rename, Action::Rename),
+            (self.tr.delete, Action::Trash),
+            (self.tr.delete_permanently, Action::DeletePermanent),
+            (self.tr.properties, Action::TogglePreview),
+        ];
+        let width = 240.0;
+        let height = 8.0 + rows.len() as f32 * 34.0;
+        let rect = Rect::from_min_size(pos, Vec2::new(width, height));
+        let painter = ui.painter();
+        painter.rect_filled(
+            rect.translate(Vec2::new(0.0, 3.0)),
+            CornerRadius::same(8),
+            Color32::from_black_alpha(80),
+        );
+        painter.rect_filled(rect, CornerRadius::same(8), palette.card);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(8),
+            Stroke::new(1.0, palette.stroke),
+            egui::StrokeKind::Inside,
+        );
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect.shrink(4.0))
+                .layout(Layout::top_down(Align::Min)),
+        );
+        let mut chosen = None;
+        for (label, action) in rows {
+            if command_button(&mut child, icons::CHEVRON_RIGHT, label, palette).clicked() {
+                chosen = Some(action);
+            }
+        }
+        if let Some(action) = chosen {
+            if self.pane != Pane::Analyzer {
+                self.tab_mut().selected = vec![path.clone()];
+            }
+            if action == Action::TogglePreview {
+                self.show_preview = true;
+                let _ = self.commands.send(Command::Preview { path });
+            } else if action == Action::Open && self.pane == Pane::Analyzer && path.is_dir() {
+                self.request_analyze(path);
+            } else if action == Action::Open {
+                self.open_selection();
+            } else {
+                self.perform(action);
+            }
+            self.context_menu = None;
+        } else if ui.input(|input| input.pointer.primary_clicked()) {
+            let inside = ui
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pointer| rect.contains(pointer));
+            if !inside {
+                self.context_menu = None;
             }
         }
     }
@@ -1698,31 +1881,125 @@ fn drive_crumb(app: &RustFilesApp, label: &str, path: &std::path::Path) -> Strin
         .unwrap_or_else(|| label.to_string())
 }
 
-fn caption_mark(id: &str, maximized: bool) -> (String, FontId) {
-    #[cfg(windows)]
-    {
-        let code = match id {
-            "min" => 0xE921,
-            "max" if maximized => 0xE923,
-            "max" => 0xE922,
-            _ => 0xE8BB,
-        };
-        let mark = char::from_u32(code).unwrap_or(' ').to_string();
-        (
-            mark,
-            FontId::new(11.0, egui::FontFamily::Name("mdl2".into())),
-        )
+fn snap_pos(ui: &Ui, pos: egui::Pos2) -> egui::Pos2 {
+    let scale = ui.pixels_per_point();
+    egui::pos2(
+        (pos.x * scale).round() / scale,
+        (pos.y * scale).round() / scale,
+    )
+}
+
+fn paint_caption_glyph(ui: &Ui, button: Rect, id: &str, maximized: bool, color: Color32) {
+    let center = snap_pos(ui, button.center());
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.0, color);
+    match id {
+        "min" => {
+            painter.hline((center.x - 5.0)..=(center.x + 5.0), center.y, stroke);
+        }
+        "max" if maximized => {
+            let back = Rect::from_center_size(center + Vec2::new(1.0, -1.0), Vec2::splat(8.0));
+            let front = Rect::from_center_size(center + Vec2::new(-1.0, 1.0), Vec2::splat(8.0));
+            painter.rect_stroke(back, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
+            painter.rect_filled(front, CornerRadius::ZERO, Color32::TRANSPARENT);
+            painter.rect_stroke(front, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
+        }
+        "max" => {
+            let mark = Rect::from_center_size(center, Vec2::splat(10.0));
+            painter.rect_stroke(mark, CornerRadius::ZERO, stroke, egui::StrokeKind::Inside);
+        }
+        _ => {
+            let half = 5.0;
+            painter.line_segment(
+                [
+                    center + Vec2::new(-half, -half),
+                    center + Vec2::new(half, half),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + Vec2::new(half, -half),
+                    center + Vec2::new(-half, half),
+                ],
+                stroke,
+            );
+        }
     }
-    #[cfg(not(windows))]
-    {
-        let glyph = match id {
-            "min" => icons::SUBTRACT,
-            "max" if maximized => icons::RESTORE,
-            "max" => icons::MAXIMIZE,
-            _ => icons::DISMISS,
-        };
-        (icons::glyph(glyph), icon_font(12.0))
-    }
+}
+
+fn flyout<T: Copy + PartialEq>(
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    openness: f32,
+    rows: &[(T, &str, u32)],
+    current: Option<T>,
+    palette: FilesPalette,
+) -> Option<T> {
+    let width = 220.0;
+    let height = 8.0 + rows.len() as f32 * 34.0;
+    let rect = Rect::from_min_size(pos, Vec2::new(width, height));
+    let mut chosen = None;
+    egui::Area::new(egui::Id::unique("layout-flyout-area"))
+        .fixed_pos(rect.min)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect.translate(Vec2::new(0.0, 4.0)),
+                CornerRadius::same(8),
+                Color32::from_black_alpha((120.0 * openness) as u8),
+            );
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(8),
+                palette.card.gamma_multiply(openness),
+            );
+            painter.rect_stroke(
+                rect,
+                CornerRadius::same(8),
+                Stroke::new(1.0, palette.stroke),
+                egui::StrokeKind::Inside,
+            );
+            ui.set_min_size(rect.size());
+            ui.add_space(4.0);
+            for (mode, label, glyph) in rows {
+                let (row, response) =
+                    ui.allocate_exact_size(Vec2::new(width - 8.0, 34.0), Sense::click());
+                if response.hovered() {
+                    ui.painter()
+                        .rect_filled(row, CornerRadius::same(4), palette.hover);
+                }
+                let checked = current.is_some_and(|current| current == *mode);
+                ui.painter().text(
+                    row.left_center() + Vec2::new(12.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    icons::glyph(*glyph),
+                    icon_font(16.0),
+                    palette.text,
+                );
+                ui.painter().text(
+                    row.left_center() + Vec2::new(36.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    *label,
+                    FontId::proportional(14.0),
+                    palette.text,
+                );
+                if checked {
+                    ui.painter().text(
+                        row.right_center() - Vec2::new(16.0, 0.0),
+                        egui::Align2::RIGHT_CENTER,
+                        icons::glyph(icons::CHECK),
+                        icon_font(14.0),
+                        palette.accent,
+                    );
+                }
+                if response.clicked() {
+                    chosen = Some(*mode);
+                }
+            }
+        });
+    chosen
 }
 
 fn tab_title(tab: &crate::app::Tab, tr: &crate::i18n::Strings) -> String {
@@ -1847,7 +2124,7 @@ fn nav_button(ui: &mut Ui, glyph: u32, enabled: bool, palette: FilesPalette) -> 
     response
 }
 fn command_button(ui: &mut Ui, glyph: u32, label: &str, palette: FilesPalette) -> egui::Response {
-    let width = 30.0 + label.len() as f32 * 7.0;
+    let width = 44.0 + label.chars().count() as f32 * 8.2;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click());
     if response.hovered() {
         ui.painter()
@@ -1889,18 +2166,40 @@ fn text_button(ui: &mut Ui, label: &str, palette: FilesPalette) -> egui::Respons
     );
     response
 }
-fn icon_button(ui: &mut Ui, glyph: u32, tip: &str, palette: FilesPalette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(4), palette.hover);
+fn icon_button(
+    ui: &mut Ui,
+    glyph: u32,
+    tip: &str,
+    palette: FilesPalette,
+    enabled: bool,
+) -> egui::Response {
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(32.0), sense);
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, enabled && response.hovered(), 0.1);
+    if hover > 0.01 {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(4),
+            palette.hover.gamma_multiply(hover),
+        );
     }
+    let color = if enabled {
+        palette.text
+    } else {
+        palette.text_secondary.gamma_multiply(0.45)
+    };
     ui.painter().text(
-        rect.center(),
+        snap_pos(ui, rect.center()),
         egui::Align2::CENTER_CENTER,
         icons::glyph(glyph),
         icon_font(16.0),
-        palette.text,
+        color,
     );
     ui.add_space(2.0);
     response.on_hover_text(tip)
@@ -2019,21 +2318,21 @@ fn section_header(
         icons::CHEVRON_RIGHT
     };
     ui.painter().text(
-        rect.left_center() + Vec2::new(4.0, 0.0),
+        rect.left_center() + Vec2::new(8.0, 0.0),
         egui::Align2::LEFT_CENTER,
         icons::glyph(glyph),
         icon_font(12.0),
         palette.text_secondary,
     );
     ui.painter().text(
-        rect.left_center() + Vec2::new(22.0, 0.0),
+        rect.left_center() + Vec2::new(28.0, 0.0),
         egui::Align2::LEFT_CENTER,
         icons::glyph(mark),
         icon_font(16.0),
         mark_color,
     );
     ui.painter().text(
-        rect.left_center() + Vec2::new(44.0, 0.0),
+        rect.left_center() + Vec2::new(52.0, 0.0),
         egui::Align2::LEFT_CENTER,
         title,
         FontId::proportional(13.0),
@@ -2094,7 +2393,7 @@ fn nav_entry(
         );
     }
     ui.painter().text(
-        pos2(icon_rect.right() + 8.0, rect.center().y),
+        pos2(icon_rect.right() + 12.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         truncate(label, 28),
         FontId::proportional(14.0),
@@ -2155,7 +2454,7 @@ fn nav_row(
         );
     }
     let y = rect.center().y;
-    let icon_rect = Rect::from_center_size(pos2(rect.left() + 8.0 + 10.0, y), Vec2::splat(20.0));
+    let icon_rect = Rect::from_center_size(pos2(rect.left() + 12.0 + 10.0, y), Vec2::splat(20.0));
     ui.painter().text(
         icon_rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -2168,7 +2467,7 @@ fn nav_row(
         },
     );
     ui.painter().text(
-        pos2(icon_rect.right() + 8.0, y),
+        pos2(icon_rect.right() + 12.0, y),
         egui::Align2::LEFT_CENTER,
         truncate(label, 28),
         FontId::proportional(14.0),
@@ -2531,7 +2830,13 @@ fn paint_type_icon(
             .color(palette.accent),
     );
 }
-fn paint_treemap(ui: &Ui, rect: Rect, cells: &[crate::worker::MapCell], palette: FilesPalette) {
+fn paint_treemap(
+    ui: &Ui,
+    rect: Rect,
+    cells: &[crate::worker::MapCell],
+    palette: FilesPalette,
+    selected: Option<&std::path::Path>,
+) {
     for cell in cells {
         let visual = Rect::from_min_size(
             rect.min + Vec2::new(cell.rect.x * rect.width(), cell.rect.y * rect.height()),
@@ -2545,6 +2850,14 @@ fn paint_treemap(ui: &Ui, rect: Rect, cells: &[crate::worker::MapCell], palette:
             CornerRadius::same(3),
             color_for(&cell.name, palette),
         );
+        if selected.is_some_and(|path| path == cell.path) {
+            ui.painter().rect_stroke(
+                visual.shrink(1.0),
+                CornerRadius::same(3),
+                Stroke::new(2.0, palette.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
         if visual.width() > 64.0 && visual.height() > 28.0 {
             ui.painter().text(
                 visual.left_top() + Vec2::new(8.0, 6.0),

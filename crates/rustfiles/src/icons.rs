@@ -18,6 +18,7 @@ pub const COPY: u32 = 62251;
 pub const PASTE: u32 = 62165;
 pub const RENAME: u32 = 63081;
 pub const DELETE: u32 = 62284;
+#[allow(dead_code)]
 pub const SHARE: u32 = 63151;
 pub const SEARCH: u32 = 63119;
 pub const DESKTOP: u32 = 62297;
