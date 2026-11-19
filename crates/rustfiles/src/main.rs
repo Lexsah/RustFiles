@@ -59,10 +59,30 @@ fn main() -> eframe::Result {
     // the solid Files fallback colors stay visible under Xvfb.
     #[cfg(windows)]
     let viewport = viewport.with_transparent(true);
-    let options = eframe::NativeOptions {
+    // Windows uses a DXGI swapchain so DWM can composite premultiplied alpha
+    // over Mica. Glow/WGL has no alpha channel, which is why the real PC stayed
+    // flat #1c1c1c. Linux and the llvmpipe CI tour stay on glow.
+    let use_wgpu =
+        cfg!(windows) && std::env::var("RUSTFILES_RENDERER").ok().as_deref() != Some("glow");
+    let mut options = eframe::NativeOptions {
         viewport,
+        renderer: if use_wgpu {
+            eframe::Renderer::Wgpu
+        } else {
+            eframe::Renderer::Glow
+        },
         ..Default::default()
     };
+    if use_wgpu {
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut create) =
+            options.wgpu_options.wgpu_setup
+        {
+            create.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
+        std::env::set_var("RUSTFILES_ALPHA_SURFACE", "wgpu-dx12-premultiplied");
+    } else {
+        std::env::set_var("RUSTFILES_ALPHA_SURFACE", "glow");
+    }
     eframe::run_native(
         "RustFiles",
         options,
@@ -125,19 +145,22 @@ fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame, ctx: &egui::Co
                     return;
                 }
                 if !app.mica_armed {
-                    let _ = platform::enable_window_backdrop(hwnd, app.dark);
+                    let line = platform::enable_window_backdrop(hwnd, app.dark);
+                    platform::write_diag(&line);
+                    app.mica_log = line;
                     app.mica_armed = true;
                     ctx.request_repaint();
                     return;
                 }
                 let _ = window_vibrancy::apply_mica(handle, Some(app.dark));
-                if platform::enable_window_backdrop(hwnd, app.dark) {
-                    app.mica_applied = true;
-                    let mut visuals = ctx.global_style().visuals.clone();
-                    visuals.window_fill = egui::Color32::TRANSPARENT;
-                    visuals.panel_fill = egui::Color32::TRANSPARENT;
-                    ctx.set_visuals(visuals);
-                }
+                let line = platform::enable_window_backdrop(hwnd, app.dark);
+                platform::write_diag(&line);
+                app.mica_log = line;
+                app.mica_applied = true;
+                let mut visuals = ctx.global_style().visuals.clone();
+                visuals.window_fill = egui::Color32::TRANSPARENT;
+                visuals.panel_fill = egui::Color32::TRANSPARENT;
+                ctx.set_visuals(visuals);
             }
         }
     }
