@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - name: Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          for attempt in 1 2 3 4 5; do
+            sudo apt-get update && sudo apt-get install -y pkg-config libx11-dev \
+              libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dev \
+              libegl1-mesa-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+              libxcb-xfixes0-dev libxcursor-dev libxi-dev xvfb && exit 0
+            echo "apt attempt ${attempt} failed; retrying"
+            sleep $((attempt * 5))
+          done
+          exit 1
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Self-test
+        run: cargo run -p rustfiles --quiet -- --self-test
+      - name: Windows UI screenshots
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $shots = Join-Path (Get-Location) "windows-shots"
+          $data = Join-Path $env:RUNNER_TEMP "rf-data"
+          $mesa = Join-Path $env:RUNNER_TEMP "mesa"
+          New-Item -ItemType Directory -Force -Path $shots, $data, $mesa | Out-Null
+          Set-Content -Path (Join-Path $data "hello.txt") -Value "hello"
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.3.0/mesa3d-26.3.0-release-msvc.7z" -OutFile $archive
+          & "C:\Program Files\7-Zip\7z.exe" x $archive "-o$mesa" -y
+          $bin = Join-Path (Get-Location) "target\debug"
+          foreach ($name in @("opengl32.dll", "libgallium_wgl.dll")) {
+            $dll = Get-ChildItem -Path $mesa -Recurse -Filter $name | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+            if (-not $dll) { throw "Mesa $name for x64 was not in the archive" }
+            Copy-Item $dll.FullName (Join-Path $bin $name)
+          }
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:LIBGL_ALWAYS_SOFTWARE = "1"
+          $env:RUSTFILES_OPEN = $data
+          $env:RUSTFILES_INDEX_PATHS = $data
+          $env:RUSTFILES_TOUR = $shots
+          $env:RUSTFILES_SIZE = "1400x900"
+          $log = Join-Path $shots "launch.txt"
+          $proc = Start-Process -FilePath (Join-Path $bin "rustfiles.exe") -WorkingDirectory $bin -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $shots "stdout.txt") -RedirectStandardError $log
+          if (-not $proc.WaitForExit(90000)) { Stop-Process -Id $proc.Id -Force }
+          Get-Content $log -ErrorAction SilentlyContinue
+          Get-ChildItem $shots | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-screenshots
+          path: windows-shots
+          if-no-files-found: warn
+      - name: Windows directory listing
+        if: runner.os == 'Windows'
+        run: cargo test -p rustfiles --bin rustfiles windows_directory_lists_through_the_ui_command -- --nocapture
+      - name: Alignment goldens
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1400x900x24" cargo test -p rustfiles --test alignment -- --nocapture
+      - name: GUI smoke (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tmp=$(mktemp -d)
+          printf 'hello' > "$tmp/hello.txt"
+          mkdir -p "$tmp/sub"
+          printf 'nested' > "$tmp/sub/nested.txt"
+          dd if=/dev/zero of="$tmp/blob.bin" bs=100 count=1 status=none
+          LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 RUSTFILES_SMOKE="$tmp" \
+            xvfb-run -a cargo run -p rustfiles --quiet
+      # windows-latest does not expose an OpenGL 2.0 context to glow, so the
+      # scripted window smoke runs on Linux only. Windows still compiles,
+      # tests, clippy-checks, and runs --self-test.
+
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+          components: rustfmt, clippy
+      - name: Linux GUI libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build
+        run: cargo build -p rustfiles --release
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/rustfiles
+          cp target/release/rustfiles README.md packaging/rustfiles.desktop dist/rustfiles/
+          tar -C dist -czf rustfiles-linux-x86_64.tar.gz rustfiles
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\rustfiles.exe dist\
+          Copy-Item README.md dist\
+          Compress-Archive -Path dist\rustfiles.exe, dist\README.md -DestinationPath rustfiles-windows-x86_64.zip
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\rustfiles.iss
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p upload
+          [ -f rustfiles-linux-x86_64.tar.gz ] && cp rustfiles-linux-x86_64.tar.gz upload/
+          [ -f rustfiles-windows-x86_64.zip ] && cp rustfiles-windows-x86_64.zip upload/
+          [ -f dist/RustFiles-0.3.5-Setup.exe ] && cp dist/RustFiles-0.3.5-Setup.exe upload/
+          ls -la upload
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: upload/*

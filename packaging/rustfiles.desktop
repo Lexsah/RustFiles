@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RustFiles
+Comment=Fast cross-platform file manager
+Exec=rustfiles
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;Utility;
+StartupNotify=true

@@ -1,0 +1,44 @@
+[package]
+name = "rustfiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+description = "Fast cross-platform file manager"
+
+[[bin]]
+name = "rustfiles"
+path = "src/main.rs"
+
+[dependencies]
+rustfiles-core = { path = "../rustfiles-core" }
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "=0.37.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify = "8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+window-vibrancy = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Ioctl",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
