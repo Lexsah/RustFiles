@@ -3,6 +3,7 @@
 mod app;
 mod i18n;
 mod icons;
+mod layout;
 mod nav;
 mod platform;
 mod theme;
@@ -69,7 +70,11 @@ impl eframe::App for app::RustFilesApp {
         }
         self.pump(ui.ctx());
         self.keys(ui.ctx());
+        if self.layout_path.is_some() {
+            self.layout_log.clear();
+        }
         self.draw(ui);
+        self.shot_step(ui.ctx());
         self.smoke_step(ui.ctx());
         if self.indexing {
             ui.ctx()

@@ -28,6 +28,7 @@ pub const MUSIC: u32 = 59476;
 pub const VIDEO: u32 = 63564;
 pub const GLOBE: u32 = 62554;
 pub const TAG: u32 = 63356;
+#[allow(dead_code)]
 pub const LIST: u32 = 62701;
 pub const GRID: u32 = 62562;
 pub const CHEVRON_RIGHT: u32 = 62128;

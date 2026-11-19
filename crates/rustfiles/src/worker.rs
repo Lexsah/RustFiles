@@ -726,7 +726,7 @@ fn preview(events: &Sender<Event>, path: &Path) {
 
 fn decode_image(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let image = image::load_from_memory(bytes).ok()?;
-    let image = image.thumbnail(512, 512);
+    let image = image.thumbnail(160, 160);
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
     Some((width, height, rgba.into_raw()))

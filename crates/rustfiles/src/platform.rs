@@ -198,6 +198,43 @@ pub fn shell_image(path: &Path, edge: u32) -> Option<(u32, u32, Vec<u8>)> {
     }
 }
 
+/// Shell bitmaps are premultiplied BGRA. egui wants straight RGBA.
+///
+/// A channel that is entirely zero is an icon with no alpha (treat it as opaque).
+/// Otherwise a zero alpha is real transparency, even when the color bytes are white.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn straight_rgba_from_bgra(pixels: &mut [u8]) {
+    let chunks = pixels.as_chunks_mut::<4>().0;
+    let any_alpha = chunks.iter().any(|pixel| pixel[3] != 0);
+    if !any_alpha {
+        for pixel in chunks.iter_mut() {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        return;
+    }
+    for pixel in chunks.iter_mut() {
+        let blue = u16::from(pixel[0]);
+        let green = u16::from(pixel[1]);
+        let red = u16::from(pixel[2]);
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            pixel[3] = 0;
+        } else if alpha == 255 {
+            pixel[0] = red as u8;
+            pixel[1] = green as u8;
+            pixel[2] = blue as u8;
+        } else {
+            pixel[0] = ((red * 255) / alpha).min(255) as u8;
+            pixel[1] = ((green * 255) / alpha).min(255) as u8;
+            pixel[2] = ((blue * 255) / alpha).min(255) as u8;
+        }
+    }
+}
+
 /// Small system icon for a path. Windows uses the shell; other platforms use the icon theme.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn file_icon_rgba(path: &Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
@@ -828,13 +865,7 @@ mod windows {
         if rows == 0 {
             return None;
         }
-        // GDI gives BGRA. egui wants RGBA.
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            if pixel[3] == 0 && (pixel[0] | pixel[1] | pixel[2]) != 0 {
-                pixel[3] = 255;
-            }
-        }
+        straight_rgba_from_bgra(&mut pixels);
         Some((width, height, pixels))
     }
 
@@ -988,12 +1019,38 @@ mod windows {
         if rows == 0 {
             return None;
         }
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            if pixel[3] == 0 && (pixel[0] | pixel[1] | pixel[2]) != 0 {
-                pixel[3] = 255;
-            }
-        }
+        straight_rgba_from_bgra(&mut pixels);
         Some((width, height, pixels))
+    }
+}
+
+#[cfg(test)]
+mod pixel_tests {
+    use super::straight_rgba_from_bgra;
+
+    #[test]
+    fn white_with_zero_alpha_stays_transparent_when_the_bitmap_has_alpha() {
+        // Premultiplied BGRA: an opaque blue pixel, and a "transparent" pixel
+        // stored as white with alpha 0. Promoting that white to opaque is the
+        // square that covered folder labels.
+        let mut pixels = vec![255, 0, 0, 255, 255, 255, 255, 0];
+        straight_rgba_from_bgra(&mut pixels);
+        assert_eq!(&pixels[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&pixels[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_bitmap_with_no_alpha_channel_becomes_opaque() {
+        let mut pixels = vec![10, 20, 30, 0, 1, 2, 3, 0];
+        straight_rgba_from_bgra(&mut pixels);
+        assert_eq!(&pixels[0..4], &[30, 20, 10, 255]);
+        assert_eq!(&pixels[4..8], &[3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn premultiplied_color_is_unpremultiplied() {
+        let mut pixels = vec![0, 0, 128, 128];
+        straight_rgba_from_bgra(&mut pixels);
+        assert_eq!(pixels, vec![255, 0, 0, 128]);
     }
 }

@@ -20,13 +20,22 @@ pub enum Pane {
     Analyzer,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Details,
+    List,
+    Tiles,
+    Grid,
+    Large,
+}
+
 pub struct Tab {
     pub path: PathBuf,
     /// Home is the Files start page (drive cards and recent files), not a folder.
     pub home: bool,
     pub history: Vec<PathBuf>,
     pub hist_pos: usize,
-    pub details: bool,
+    pub view: ViewMode,
     pub sort: SortColumn,
     pub ascending: bool,
     pub selected: Vec<PathBuf>,
@@ -46,7 +55,7 @@ impl Tab {
             hist_pos: 0,
             path,
             home,
-            details: false,
+            view: ViewMode::Tiles,
             sort: SortColumn::Name,
             ascending: true,
             selected: Vec::new(),
@@ -135,6 +144,11 @@ pub struct RustFilesApp {
     pub open_wsl: bool,
     pub open_tags: bool,
     pub new_menu: bool,
+    pub layout_menu: bool,
+    pub layout_log: Vec<(String, [f32; 4])>,
+    pub shot_path: Option<PathBuf>,
+    pub layout_path: Option<PathBuf>,
+    pub shot_sent: bool,
     pub settings_menu: bool,
     pub cache: HashMap<PathBuf, Vec<FileRow>>,
     req: u64,
@@ -239,6 +253,11 @@ impl RustFilesApp {
             open_wsl: false,
             open_tags: false,
             new_menu: false,
+            layout_menu: false,
+            layout_log: Vec::new(),
+            shot_path: std::env::var("RUSTFILES_SHOT").ok().map(PathBuf::from),
+            layout_path: std::env::var("RUSTFILES_LAYOUT").ok().map(PathBuf::from),
+            shot_sent: false,
             settings_menu: false,
             cache: HashMap::new(),
             req: 1,
@@ -258,6 +277,15 @@ impl RustFilesApp {
         }
         if let Some(file) = select_file {
             app.tabs[0].selected = vec![file];
+        }
+        if let Ok(mode) = std::env::var("RUSTFILES_VIEW") {
+            app.tabs[0].view = match mode.as_str() {
+                "details" => ViewMode::Details,
+                "list" => ViewMode::List,
+                "grid" => ViewMode::Grid,
+                "large" => ViewMode::Large,
+                _ => ViewMode::Tiles,
+            };
         }
         app
     }
@@ -745,6 +773,47 @@ impl RustFilesApp {
         self.preview_selected();
     }
 
+    pub fn mark_layout(&mut self, name: &str, rect: egui::Rect) {
+        if self.layout_path.is_none() {
+            return;
+        }
+        self.layout_log.push((
+            name.to_string(),
+            [rect.min.x, rect.min.y, rect.width(), rect.height()],
+        ));
+    }
+
+    pub fn shot_step(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.shot_path.clone() else {
+            return;
+        };
+        if self.shot_sent {
+            return;
+        }
+        let ready = self.visible_rows().iter().any(|row| row.name == "hello.txt")
+            || self.started.elapsed() > std::time::Duration::from_millis(800);
+        if !ready {
+            ctx.request_repaint();
+            return;
+        }
+        self.shot_sent = true;
+        let layout = self.layout_log.clone();
+        let layout_path = self.layout_path.clone();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+            egui::ScreenshotCallback::new(move |image| {
+                save_screenshot(&path, &image);
+                if let Some(layout_path) = layout_path {
+                    let _ = std::fs::write(
+                        layout_path,
+                        serde_json::to_string(&layout).unwrap_or_default(),
+                    );
+                }
+                std::process::exit(0);
+            }),
+        ));
+        ctx.request_repaint();
+    }
+
     pub fn request_icon(&mut self, path: &std::path::Path, px: u32) {
         if path.as_os_str().is_empty() {
             return;
@@ -966,6 +1035,20 @@ pub fn format_free(free: u64, total: u64, lang: crate::i18n::Lang) -> String {
             format_bytes(total, lang)
         ),
     }
+}
+
+fn save_screenshot(path: &std::path::Path, image: &egui::ColorImage) {
+    let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
+    for pixel in &image.pixels {
+        bytes.extend_from_slice(&pixel.to_array());
+    }
+    let _ = image::save_buffer(
+        path,
+        &bytes,
+        image.size[0] as u32,
+        image.size[1] as u32,
+        image::ColorType::Rgba8,
+    );
 }
 
 fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
