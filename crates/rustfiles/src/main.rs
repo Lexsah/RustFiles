@@ -91,11 +91,12 @@ fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame) {
     if !app.mica_applied {
         use raw_window_handle::HasWindowHandle as _;
         if let Ok(handle) = frame.window_handle() {
-            let mica = window_vibrancy::apply_mica(handle, Some(app.dark)).is_ok();
+            let _ = window_vibrancy::apply_mica(handle, Some(app.dark));
             if let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() {
                 platform::enable_window_backdrop(win.hwnd.get(), app.dark);
+                // Our own DWM call is the backdrop. Stop painting an opaque fill over it.
+                app.mica_applied = true;
             }
-            app.mica_applied = mica;
         }
     }
     #[cfg(not(windows))]

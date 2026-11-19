@@ -196,10 +196,12 @@ fn worker_loop(
     let mut last_watch = Instant::now();
     let mut next_rescan = Instant::now() + Duration::from_secs(180);
 
+    let mut scan_job: Option<std::thread::JoinHandle<Index>> = None;
     loop {
-        let command = commands.recv_timeout(Duration::from_millis(200));
+        let command = commands.recv_timeout(Duration::from_millis(50));
         match command {
             Ok(command) => {
+                let start_scan = matches!(command, Command::Boot | Command::Rescan);
                 if !handle(
                     command,
                     &mut index,
@@ -211,10 +213,37 @@ fn worker_loop(
                 ) {
                     break;
                 }
+                if start_scan {
+                    // A full volume walk must not sit in front of directory listings.
+                    // List commands keep being read on this thread while the walk runs.
+                    let volumes_for_scan = volumes.clone();
+                    let progress_for_scan = Arc::clone(&progress);
+                    scan_job = Some(std::thread::spawn(move || {
+                        scan_volumes(&volumes_for_scan, &progress_for_scan)
+                    }));
+                }
                 repaint.request_repaint();
             }
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if let Some(job) = scan_job.as_ref() {
+            if job.is_finished() {
+                let built = scan_job
+                    .take()
+                    .expect("scan job")
+                    .join()
+                    .unwrap_or_else(|_| IndexBuilder::new().finish());
+                let files = built.entry_count() as u64;
+                save_index(Some(&built));
+                index = Some(built);
+                arm_watches(&mut watcher, &volumes, &mut watch_failed, &progress);
+                let _ = events.send(Event::IndexReady {
+                    files,
+                    elapsed_ms: 0,
+                });
+                repaint.request_repaint();
+            }
         }
         while let Ok(event) = watch_rx.try_recv() {
             if let Ok(event) = event {
@@ -233,16 +262,13 @@ fn worker_loop(
             }
             repaint.request_repaint();
         }
-        if watch_failed && Instant::now() >= next_rescan && index.is_some() {
-            set_status(&progress, "Watch limit reached; rescanning volumes");
-            index = Some(scan_volumes(&volumes, &progress));
-            save_index(index.as_ref());
-            let _ = events.send(Event::IndexReady {
-                files: index.as_ref().map(Index::entry_count).unwrap_or(0) as u64,
-                elapsed_ms: 0,
-            });
+        if watch_failed && scan_job.is_none() && Instant::now() >= next_rescan && index.is_some() {
+            let volumes_for_scan = volumes.clone();
+            let progress_for_scan = Arc::clone(&progress);
+            scan_job = Some(std::thread::spawn(move || {
+                scan_volumes(&volumes_for_scan, &progress_for_scan)
+            }));
             next_rescan = Instant::now() + Duration::from_secs(180);
-            repaint.request_repaint();
         }
     }
 }
@@ -257,7 +283,9 @@ fn handle(
     watch_failed: &mut bool,
 ) -> bool {
     match command {
-        Command::Boot => boot(index, volumes, events, progress, watcher, watch_failed),
+        Command::Boot => {
+            boot(index, volumes, events, progress, watcher, watch_failed);
+        }
         Command::List {
             path,
             show_hidden,
@@ -268,12 +296,7 @@ fn handle(
         Command::Rescan => {
             set_status(progress, "Rebuilding the filename index");
             progress.files.store(0, Ordering::Relaxed);
-            *index = Some(scan_volumes(volumes, progress));
-            save_index(index.as_ref());
-            let _ = events.send(Event::IndexReady {
-                files: index.as_ref().map(Index::entry_count).unwrap_or(0) as u64,
-                elapsed_ms: 0,
-            });
+            // The worker loop starts the walk on another thread so listings stay live.
         }
         Command::Paste { dest, clip } => match rustfiles_core::paste(&clip, &dest) {
             Ok(paths) => {
@@ -377,6 +400,7 @@ fn boot(
     let _ = events.send(Event::Volumes(volumes.clone()));
     let started = Instant::now();
     let path = platform::index_path();
+    let mut needs_scan = true;
     if let Ok(loaded) = Index::load(&path) {
         set_status(progress, "Loaded the saved index");
         *index = Some(loaded);
@@ -385,28 +409,21 @@ fn boot(
             elapsed_ms: started.elapsed().as_millis(),
         });
         if let Some(current) = index.as_mut() {
-            if !catch_up(current, progress) {
-                set_status(progress, "Journal cursor is stale; walking volumes");
-                *index = Some(scan_volumes(volumes, progress));
+            if catch_up(current, progress) {
                 save_index(index.as_ref());
-                let _ = events.send(Event::IndexReady {
-                    files: index.as_ref().map(Index::entry_count).unwrap_or(0) as u64,
-                    elapsed_ms: started.elapsed().as_millis(),
-                });
-            } else {
-                save_index(index.as_ref());
+                needs_scan = false;
             }
         }
-    } else {
-        set_status(progress, "Building the filename index");
-        *index = Some(scan_volumes(volumes, progress));
-        save_index(index.as_ref());
-        let _ = events.send(Event::IndexReady {
-            files: index.as_ref().map(Index::entry_count).unwrap_or(0) as u64,
-            elapsed_ms: started.elapsed().as_millis(),
-        });
     }
-    arm_watches(watcher, volumes, watch_failed, progress);
+    if needs_scan {
+        set_status(progress, "Indexing");
+    } else {
+        arm_watches(watcher, volumes, watch_failed, progress);
+    }
+    // `needs_scan` is observed by the caller via the Boot command, which always
+    // starts the background walk. When catch-up succeeded the walk still refreshes
+    // volumes that were not read from the USN journal. Listings do not wait for it.
+    let _ = needs_scan;
 }
 
 fn catch_up(index: &mut Index, progress: &Progress) -> bool {
@@ -523,38 +540,45 @@ fn list(
     show_hidden: bool,
     req: u64,
 ) {
-    if let Some(index) = index.as_mut() {
-        if let Some(id) = index.find_path(&path.display().to_string()) {
-            let mut rows = index.list_dir(id, show_hidden);
-            rows.retain(|row| show_hidden || !row.hidden);
-            let _ = events.send(Event::Listing {
-                req,
-                path,
-                rows,
-                from_index: true,
-            });
-            return;
-        }
-    }
-    match list_directory(&path) {
+    // The window always needs the real directory. An index node can exist and
+    // still have no children while a volume walk is running, and returning that
+    // empty node is what made every folder look empty.
+    let disk = match list_directory(&path) {
         Ok(mut rows) => {
             if !show_hidden {
                 rows.retain(|row| !row.hidden);
             }
-            let _ = events.send(Event::Listing {
-                req,
-                path,
-                rows,
-                from_index: false,
-            });
+            rows
         }
         Err(err) => {
             let _ = events.send(Event::Error(format!(
                 "Cannot open {}: {err}",
                 path.display()
             )));
+            return;
+        }
+    };
+    if let Some(index) = index.as_mut() {
+        if let Some(id) = index.find_path(&path.display().to_string()) {
+            let mut rows = index.list_dir(id, show_hidden);
+            rows.retain(|row| show_hidden || !row.hidden);
+            if !rows.is_empty() || disk.is_empty() {
+                let _ = events.send(Event::Listing {
+                    req,
+                    path,
+                    rows,
+                    from_index: true,
+                });
+                return;
+            }
         }
     }
+    let _ = events.send(Event::Listing {
+        req,
+        path,
+        rows: disk,
+        from_index: false,
+    });
 }
 
 fn search(index: &Option<Index>, events: &Sender<Event>, query: String, req: u64) {
@@ -834,5 +858,84 @@ fn queue_watch(pending: &mut Vec<PathBuf>, event: &NotifyEvent) {
 fn set_status(progress: &Progress, text: &str) {
     if let Ok(mut status) = progress.status.lock() {
         *status = text.to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list, Event, Index};
+    use rustfiles_core::FileRow;
+    use rustfiles_core::IndexBuilder;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+
+    fn listing_rows(path: PathBuf, index: &mut Option<Index>) -> Vec<FileRow> {
+        let (tx, rx) = mpsc::channel();
+        list(index, &tx, path, false, 1);
+        match rx.recv().expect("listing event") {
+            Event::Listing { rows, .. } => rows,
+            Event::Error(message) => panic!("listing failed: {message}"),
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn listing_returns_directory_children_without_an_index() {
+        let dir = std::env::temp_dir().join(format!("rustfiles-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("hello.txt"), b"hello").unwrap();
+        let mut index = None;
+        let rows = listing_rows(dir.clone(), &mut index);
+        assert!(
+            rows.iter().any(|row| row.name == "hello.txt"),
+            "expected hello.txt, got {:?}",
+            rows.iter().map(|row| &row.name).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|row| row.name == "sub" && row.is_dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listing_does_not_trust_an_empty_index_node() {
+        let dir =
+            std::env::temp_dir().join(format!("rustfiles-empty-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("present.txt"), b"x").unwrap();
+        let mut builder = IndexBuilder::new();
+        builder.add_volume(dir.display().to_string(), "temp".to_string(), cfg!(windows));
+        let mut index = Some(builder.finish());
+        let rows = listing_rows(dir.clone(), &mut index);
+        assert!(
+            rows.iter().any(|row| row.name == "present.txt"),
+            "empty index node hid the real directory: {:?}",
+            rows.iter().map(|row| &row.name).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same `list` path the window uses. Windows CI must see a real system directory.
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_lists_through_the_ui_command() {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let path = PathBuf::from(&root);
+        let mut index = None;
+        let rows = listing_rows(path, &mut index);
+        assert!(
+            !rows.is_empty(),
+            "{root} listed no files through the UI command"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.name.eq_ignore_ascii_case("System32")),
+            "System32 missing from {root}: {:?}",
+            rows.iter()
+                .map(|row| &row.name)
+                .take(12)
+                .collect::<Vec<_>>()
+        );
     }
 }

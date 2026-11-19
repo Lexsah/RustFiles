@@ -126,6 +126,7 @@ pub struct RustFilesApp {
     pub icon_px: HashMap<PathBuf, u32>,
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
+    pub lang: crate::i18n::Lang,
     pub tr: crate::i18n::Strings,
     pub open_fav: bool,
     pub open_drives: bool,
@@ -188,7 +189,8 @@ impl RustFilesApp {
             ];
         }
         let home = smoke_path.is_none() && opened.is_none();
-        let tr = crate::i18n::strings(crate::i18n::system_lang());
+        let lang = crate::i18n::system_lang();
+        let tr = crate::i18n::strings(lang);
         let mut app = Self {
             tabs: vec![Tab::at(start.clone(), home)],
             current: 0,
@@ -228,6 +230,7 @@ impl RustFilesApp {
             icon_px: HashMap::new(),
             icon_tx,
             mica_applied: false,
+            lang,
             tr,
             open_fav: true,
             open_drives: true,
@@ -296,14 +299,15 @@ impl RustFilesApp {
                 rows,
                 from_index,
             } => {
-                if self.tab().path == path {
+                if paths_match(&self.tab().path, &path) {
                     let mut rows = rows;
                     let sort = self.tab().sort;
                     let ascending = self.tab().ascending;
                     sort_rows(&mut rows, sort, ascending, true);
                     self.cache.insert(path, rows.clone());
-                    let tab = self.tab_mut();
-                    if tab.req == req || req == 0 {
+                    let accept = self.tab().req == req || req == 0 || self.tab().rows.is_empty();
+                    if accept {
+                        let tab = self.tab_mut();
                         tab.rows = rows;
                         tab.from_index = from_index;
                     }
@@ -907,15 +911,72 @@ fn load_config() -> Config {
         .unwrap_or_default()
 }
 
-pub fn format_modified(unix: u64) -> String {
+pub fn format_modified_lang(unix: u64, lang: crate::i18n::Lang) -> String {
     use chrono::TimeZone;
     if unix == 0 {
         return String::new();
     }
+    let pattern = match lang {
+        crate::i18n::Lang::Fr => "%d/%m/%Y %H:%M",
+        crate::i18n::Lang::En => "%Y-%m-%d %H:%M",
+    };
     match chrono::Local.timestamp_opt(unix as i64, 0) {
-        chrono::MappedLocalTime::Single(time) => time.format("%Y-%m-%d %H:%M").to_string(),
+        chrono::MappedLocalTime::Single(time) => time.format(pattern).to_string(),
         _ => String::new(),
     }
+}
+
+pub fn format_bytes(bytes: u64, lang: crate::i18n::Lang) -> String {
+    let french = lang == crate::i18n::Lang::Fr;
+    let units: [&str; 5] = if french {
+        ["o", "Ko", "Mo", "Go", "To"]
+    } else {
+        ["B", "KB", "MB", "GB", "TB"]
+    };
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < units.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let text = if unit == 0 {
+        format!("{} {}", bytes, units[0])
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", units[unit])
+    } else {
+        format!("{value:.1} {}", units[unit])
+    };
+    if french {
+        text.replace('.', ",")
+    } else {
+        text
+    }
+}
+
+pub fn format_free(free: u64, total: u64, lang: crate::i18n::Lang) -> String {
+    match lang {
+        crate::i18n::Lang::Fr => format!(
+            "{} libres sur {}",
+            format_bytes(free, lang),
+            format_bytes(total, lang)
+        ),
+        crate::i18n::Lang::En => format!(
+            "{} free of {}",
+            format_bytes(free, lang),
+            format_bytes(total, lang)
+        ),
+    }
+}
+
+fn paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
+    use std::path::Component;
+    let normalize = |path: &std::path::Path| {
+        path.components()
+            .filter(|component| !matches!(component, Component::CurDir))
+            .map(|component| component.as_os_str().to_os_string())
+            .collect::<Vec<_>>()
+    };
+    normalize(left) == normalize(right)
 }
 
 pub fn type_name(row: &FileRow) -> String {

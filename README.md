@@ -17,7 +17,7 @@ Slint's Fluent style was the other way to get closer to WinUI. It still would no
 
 ## Features in 0.3
 
-Version 0.3 follows the Files layout more closely: larger Segoe UI Variable text and rows, a Mica Alt backdrop on Windows 11, shell icons and thumbnails loaded off the UI thread, breadcrumb chips, icon command buttons, collapsible sidebar sections, a large icon view, and English or French strings from the OS language. A path on the command line opens that folder. Access-denied MFT reads fall back to a directory walk without putting the raw error in the status bar.
+Version 0.3.1 lists a folder from disk immediately, even while the filename index is still walking the drives, and does not treat an empty index node as an empty folder. Version 0.3 follows the Files layout more closely: larger Segoe UI Variable text and rows, a Mica Alt backdrop on Windows 11, shell icons and thumbnails loaded off the UI thread, breadcrumb chips, icon command buttons, collapsible sidebar sections, a large icon view, and English or French strings from the OS language. A path on the command line opens that folder. Access-denied MFT reads fall back to a directory walk without putting the raw error in the status bar.
 
 ## Features in 0.2
 

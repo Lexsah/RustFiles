@@ -8,7 +8,7 @@ use egui::{
 };
 use rustfiles_core::{format_size, FileRow, SortColumn};
 
-use crate::app::{format_modified, type_name, Pane, RustFilesApp};
+use crate::app::{format_free, format_modified_lang, type_name, Pane, RustFilesApp};
 use crate::icons::{self, icon_font};
 use crate::nav::{self, Action};
 use crate::platform::{self, Places};
@@ -69,14 +69,27 @@ impl RustFilesApp {
             palette.sidebar
         };
         let file_fill = if self.mica_applied {
-            Color32::TRANSPARENT
+            if self.dark {
+                Color32::from_rgba_unmultiplied(44, 44, 44, 160)
+            } else {
+                Color32::from_rgba_unmultiplied(252, 252, 252, 180)
+            }
         } else {
             palette.file_area
         };
+        let file_radius = if self.mica_applied {
+            CornerRadius {
+                nw: 8,
+                ne: 0,
+                sw: 0,
+                se: 0,
+            }
+        } else {
+            CornerRadius::ZERO
+        };
         ui.painter()
             .rect_filled(side, CornerRadius::ZERO, side_fill);
-        ui.painter()
-            .rect_filled(content, CornerRadius::ZERO, file_fill);
+        ui.painter().rect_filled(content, file_radius, file_fill);
         if preview_w > 0.0 {
             ui.painter()
                 .rect_filled(preview, CornerRadius::ZERO, palette.sidebar);
@@ -503,11 +516,7 @@ impl RustFilesApp {
                 }
                 if section_header(side, self.tr.drives, &mut self.open_drives, palette) {
                     for volume in self.volumes.clone() {
-                        let label = if volume.label.is_empty() {
-                            volume.mount.clone()
-                        } else {
-                            volume.label.clone()
-                        };
+                        let label = drive_title(&volume.label, &volume.mount, self.lang);
                         let mount = PathBuf::from(&volume.mount);
                         if nav_entry(side, self, Some(&mount), icons::HARD_DRIVE, &label, palette)
                             .clicked()
@@ -621,19 +630,23 @@ impl RustFilesApp {
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
             for volume in self.volumes.clone() {
-                let (total, free) =
-                    platform::disk_usage(std::path::Path::new(&volume.mount)).unwrap_or((0, 0));
+                let mount = PathBuf::from(&volume.mount);
+                self.request_icon(&mount, 32);
+                let icon = self.icons_tex.get(&mount).cloned();
+                let (total, free) = platform::disk_usage(&mount).unwrap_or((0, 0));
+                let title = drive_title(&volume.label, &volume.mount, self.lang);
                 if drive_card(
                     ui,
-                    &volume.label,
-                    &volume.mount,
+                    &title,
                     total.saturating_sub(free),
                     total,
                     palette,
+                    self.lang,
+                    icon.as_ref(),
                 )
                 .clicked()
                 {
-                    self.navigate(PathBuf::from(volume.mount));
+                    self.navigate(mount);
                 }
             }
         });
@@ -657,7 +670,7 @@ impl RustFilesApp {
                 ui,
                 icons::type_glyph(row.is_dir, &row.name),
                 &row.name,
-                &format_modified(row.modified),
+                &format_modified_lang(row.modified, self.lang),
                 palette,
                 icon.as_ref(),
             )
@@ -711,7 +724,7 @@ impl RustFilesApp {
                     let row = &self.visible_rows()[index];
                     let selected = self.tab().selected.iter().any(|path| path == &row.path);
                     let name = row.name.clone();
-                    let modified = format_modified(row.modified);
+                    let modified = format_modified_lang(row.modified, self.lang);
                     let kind = type_name(row);
                     let size = if row.is_dir && row.size == 0 {
                         String::new()
@@ -915,7 +928,7 @@ impl RustFilesApp {
             detail_line(
                 &mut pane,
                 "Modified",
-                &format_modified(row.modified),
+                &format_modified_lang(row.modified, self.lang),
                 palette,
             );
         }
@@ -1586,15 +1599,37 @@ fn drive_row(
     );
     response
 }
+fn drive_title(label: &str, mount: &str, lang: crate::i18n::Lang) -> String {
+    let trimmed = mount.trim_end_matches(['\\', '/']);
+    let letter = if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(trimmed)
+            .to_string()
+    };
+    if label.is_empty() || label == mount || label.eq_ignore_ascii_case(&letter) {
+        match lang {
+            crate::i18n::Lang::Fr => format!("Disque local ({letter})"),
+            crate::i18n::Lang::En => format!("Local disk ({letter})"),
+        }
+    } else {
+        format!("{label} ({letter})")
+    }
+}
+
 fn drive_card(
     ui: &mut Ui,
     label: &str,
-    mount: &str,
     used: u64,
     total: u64,
     palette: FilesPalette,
+    lang: crate::i18n::Lang,
+    icon: Option<&egui::TextureHandle>,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(230.0, 96.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(260.0, 112.0), Sense::click());
     ui.painter().rect(
         rect,
         CornerRadius::same(8),
@@ -1602,24 +1637,34 @@ fn drive_card(
         Stroke::new(1.0, palette.stroke),
         egui::StrokeKind::Inside,
     );
+    let icon_rect = Rect::from_min_size(rect.left_top() + Vec2::new(16.0, 16.0), Vec2::splat(28.0));
+    if let Some(texture) = icon {
+        ui.painter().image(
+            texture.id(),
+            icon_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    } else {
+        ui.painter().text(
+            icon_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            icons::glyph(icons::HARD_DRIVE),
+            icon_font(22.0),
+            palette.accent,
+        );
+    }
     ui.painter().text(
-        rect.left_top() + Vec2::new(14.0, 14.0),
+        rect.left_top() + Vec2::new(52.0, 18.0),
         egui::Align2::LEFT_TOP,
-        icons::glyph(icons::HARD_DRIVE),
-        icon_font(22.0),
-        palette.accent,
-    );
-    ui.painter().text(
-        rect.left_top() + Vec2::new(46.0, 16.0),
-        egui::Align2::LEFT_TOP,
-        truncate(if label.is_empty() { mount } else { label }, 16),
+        truncate(label, 22),
         FontId::proportional(15.0),
         palette.text,
     );
     let caption = if total == 0 {
-        mount.to_string()
+        String::new()
     } else {
-        format!("{} free", format_size(total - used))
+        format_free(total - used, total, lang)
     };
     ui.painter().text(
         rect.left_top() + Vec2::new(14.0, 48.0),
