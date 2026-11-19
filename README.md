@@ -61,8 +61,8 @@ Install a stable Rust toolchain (the repository pins 1.100.0) and a C build envi
 Linux also needs the glow / winit libraries:
 
 ```bash
-sudo apt-get install pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
-  libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
+sudo apt-get install pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
   libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev
 cargo run -p rustfiles --release
 ```

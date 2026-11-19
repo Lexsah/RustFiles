@@ -27,8 +27,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev xvfb
       - uses: Swatinem/rust-cache@v2
       - name: Test
@@ -47,18 +47,9 @@ jobs:
           dd if=/dev/zero of="$tmp/blob.bin" bs=100 count=1 status=none
           LIBGL_ALWAYS_SOFTWARE=1 WINIT_UNIX_BACKEND=x11 RUSTFILES_SMOKE="$tmp" \
             xvfb-run -a cargo run -p rustfiles --quiet
-      - name: GUI smoke (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $tmp = Join-Path $env:TEMP ("rustfiles-smoke-" + [guid]::NewGuid().ToString("N"))
-          New-Item -ItemType Directory -Path (Join-Path $tmp "sub") -Force | Out-Null
-          Set-Content -Path (Join-Path $tmp "hello.txt") -Value "hello" -NoNewline
-          Set-Content -Path (Join-Path $tmp "sub\nested.txt") -Value "nested" -NoNewline
-          [IO.File]::WriteAllBytes((Join-Path $tmp "blob.bin"), (New-Object byte[] 100))
-          $env:RUSTFILES_SMOKE = $tmp
-          cargo run -p rustfiles --quiet
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # windows-latest does not expose an OpenGL 2.0 context to glow, so the
+      # scripted window smoke runs on Linux only. Windows still compiles,
+      # tests, clippy-checks, and runs --self-test.
 
   release:
     name: Release (${{ matrix.os }})
@@ -81,8 +72,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libgl1-mesa-dev libegl1-mesa-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxi-dev
       - uses: Swatinem/rust-cache@v2
       - name: Release build
