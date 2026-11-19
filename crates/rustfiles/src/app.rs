@@ -1,6 +1,6 @@
 //! Window state. Drawing lives in `ui.rs`; the index lives on the worker thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -22,6 +22,8 @@ pub enum Pane {
 
 pub struct Tab {
     pub path: PathBuf,
+    /// Home is the Files start page (drive cards and recent files), not a folder.
+    pub home: bool,
     pub history: Vec<PathBuf>,
     pub hist_pos: usize,
     pub details: bool,
@@ -38,11 +40,12 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(path: PathBuf) -> Self {
+    pub fn at(path: PathBuf, home: bool) -> Self {
         Self {
             history: vec![path.clone()],
             hist_pos: 0,
             path,
+            home,
             details: true,
             sort: SortColumn::Name,
             ascending: true,
@@ -116,6 +119,11 @@ pub struct RustFilesApp {
     pub preview_text: String,
     pub preview_image: Option<egui::TextureHandle>,
     pub preview_note: String,
+    pub thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    pub icons_tex: HashMap<PathBuf, egui::TextureHandle>,
+    pub icon_miss: HashSet<PathBuf>,
+    pub thumb_asked: HashSet<PathBuf>,
+    pub mica_applied: bool,
     pub cache: HashMap<PathBuf, Vec<FileRow>>,
     req: u64,
     smoke: Option<Smoke>,
@@ -125,6 +133,7 @@ pub struct RustFilesApp {
 impl RustFilesApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = load_config();
+        install_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.dark);
         let (commands, command_rx) = std::sync::mpsc::channel();
         let (event_tx, events) = std::sync::mpsc::channel();
@@ -154,8 +163,9 @@ impl RustFilesApp {
                 places.videos.clone(),
             ];
         }
+        let home = smoke_path.is_none();
         let mut app = Self {
-            tabs: vec![Tab::new(start.clone())],
+            tabs: vec![Tab::at(start.clone(), home)],
             current: 0,
             places,
             volumes: Vec::new(),
@@ -186,6 +196,11 @@ impl RustFilesApp {
             preview_text: String::new(),
             preview_image: None,
             preview_note: String::new(),
+            thumbs: HashMap::new(),
+            icons_tex: HashMap::new(),
+            icon_miss: HashSet::new(),
+            thumb_asked: HashSet::new(),
+            mica_applied: false,
             cache: HashMap::new(),
             req: 1,
             smoke: smoke_path.map(|path| Smoke {
@@ -199,7 +214,9 @@ impl RustFilesApp {
         if let Some(rows) = app.cache.get(&app.tabs[0].path).cloned() {
             app.tabs[0].rows = rows;
         }
-        app.request_list();
+        if !home {
+            app.request_list();
+        }
         app
     }
 
@@ -307,6 +324,25 @@ impl RustFilesApp {
                 if self.tab().path == refresh {
                     self.request_list();
                 }
+            }
+            Event::Thumb {
+                path,
+                width,
+                height,
+                rgba,
+            } => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                self.thumbs.insert(
+                    path.clone(),
+                    ctx.load_texture(
+                        path.display().to_string(),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    ),
+                );
             }
             Event::Error(message) => self.status = message,
         }
@@ -447,6 +483,7 @@ impl RustFilesApp {
         self.pane = Pane::Files;
         {
             let tab = self.tab_mut();
+            tab.home = false;
             if tab.path != path {
                 tab.history.truncate(tab.hist_pos + 1);
                 tab.history.push(path.clone());
@@ -470,6 +507,7 @@ impl RustFilesApp {
         }
         tab.hist_pos = next as usize;
         tab.path = tab.history[tab.hist_pos].clone();
+        tab.home = false;
         tab.selected.clear();
         let path = tab.path.clone();
         if let Some(cached) = self.cache.get(&path).cloned() {
@@ -517,11 +555,9 @@ impl RustFilesApp {
     }
 
     fn new_tab(&mut self) {
-        let path = self.places.home.clone();
-        self.tabs.push(Tab::new(path));
+        self.tabs.push(Tab::at(self.places.home.clone(), true));
         self.current = self.tabs.len() - 1;
         self.pane = Pane::Files;
-        self.request_list();
     }
 
     fn close_tab(&mut self) {
@@ -713,12 +749,38 @@ impl RustFilesApp {
         if self.started.elapsed() > std::time::Duration::from_secs(20) {
             let smoke = self.smoke.as_ref().unwrap();
             eprintln!(
-                "smoke failed listing={} search={} analyze={} rows={rows} hits={hits} cells={cells}",
-                smoke.saw_listing, smoke.saw_search, smoke.saw_analyze
+                "smoke failed listing={} search={} analyze={} rows={rows} hits={hits} cells={cells} status={}",
+                smoke.saw_listing, smoke.saw_search, smoke.saw_analyze, self.status
             );
             std::process::exit(1);
         }
     }
+}
+
+fn install_fonts(ctx: &Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "fluent".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fluent-icons.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Name("fluent".into()))
+        .or_default()
+        .push("fluent".into());
+    #[cfg(windows)]
+    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts.font_data.insert(
+            "segoe".into(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            proportional.insert(0, "segoe".into());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 pub fn apply_theme(ctx: &Context, dark: bool) {

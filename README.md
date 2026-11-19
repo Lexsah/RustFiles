@@ -6,25 +6,30 @@ Files is a C# / WinUI app and only runs on Windows. RustFiles is one codebase fo
 
 ## Why egui
 
-The UI is [egui](https://github.com/emilk/egui) 0.37 on [eframe](https://github.com/emilk/egui/tree/master/crates/eframe), using the glow renderer.
+The window is [egui](https://github.com/emilk/egui) 0.37 on [eframe](https://github.com/emilk/egui/tree/master/crates/eframe), using the glow renderer. The chrome is custom-painted to follow the Files layout (title-bar tabs, navigation row, command bar, sidebar, home page, details and icon views, details pane, status bar) instead of stock egui panels.
 
 - One immediate-mode UI on both operating systems. There is no WinUI or GTK split, and no second widget toolkit to keep in sync.
 - Directory listings are virtualized. A folder with tens of thousands of entries only builds the rows on screen.
 - Glow is a thin OpenGL layer. It starts quickly and does not compile a wgpu shader pipeline on launch, which matters on older GPUs and remote desktops. A file manager is a 2D list; the slow part is the disk, and that work is off the UI thread.
+- On Windows 11 the window asks for Mica through `window-vibrancy` and loads Segoe UI. Linux uses the same Files palette as a solid fallback, plus a bundled subset of Fluent System Icons. File-type icons come from the Windows shell or a freedesktop PNG theme when one is installed.
 
-iced and Slint were the other serious options. iced is a good fit for structured apps, but virtualizing huge lists is more code. Slint looks closer to a native toolkit and adds a separate UI language. WinUI cannot leave Windows, which is the constraint this port exists to remove.
+Slint's Fluent style was the other way to get closer to WinUI. It still would not reproduce the Files shell (tab strip, breadcrumb, command bar, drive cards) without a custom design, and it would split the UI into a second language. The indexer, search, and analyzer stay in Rust either way, so 0.2 keeps egui and paints the Files shell directly.
 
-## Features in 0.1
+## Features in 0.2
 
-- Tabs, back / forward / up, breadcrumbs, and an editable path
-- Sidebar with favorites (pin the current folder) and detected drives or mount points
-- Details and grid views, with name / date / type / size sorting and directories kept first
-- Preview pane for text files and png, jpeg, gif, and bmp images
+- Files-style shell: custom title bar with tabs and caption buttons, back / forward / up / refresh, breadcrumb address bar, search box, and a command bar (New, Cut, Copy, Paste, Rename, Delete, Share, Sort, view, Analyze)
+- Sidebar with Home, favorites, drives and usage bars, and entries for Network, Tags, and the Recycle Bin
+- Home page with drive cards and recent files from Desktop, Documents, and Downloads
+- Details and icon views, with Name / Date modified / Type / Size columns
+- Details pane for the selection, including image previews
+- System file-type icons where the platform provides them, and image thumbnails in the icon view
+- Light and dark palettes taken from Files' theme dictionaries
 - Copy, cut, paste, rename, New Folder, and delete to the system trash (Shift+Delete asks before a permanent delete)
-- Dark and light themes, saved between launches
 - Keyboard shortcuts (F1 lists them in the app)
 - Incremental filename search over a persistent index
-- Disk analyzer: size-sorted children, squarified treemap, single-ring sunburst, click to drill in
+- Disk analyzer in the same shell: size-sorted children, squarified treemap, single-ring sunburst, click to drill in
+
+Network, tags, and sharing are shown in the shell and report that they are not available. The Recycle Bin opens the Windows shell folder, or `~/.local/share/Trash/files` on Linux.
 
 ## Not ported yet
 

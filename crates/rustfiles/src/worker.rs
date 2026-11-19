@@ -56,6 +56,10 @@ pub enum Command {
     Preview {
         path: PathBuf,
     },
+    /// Decode a small image thumbnail off the UI thread.
+    Thumb {
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +113,12 @@ pub enum Event {
     OpDone {
         message: String,
         refresh: PathBuf,
+    },
+    Thumb {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
     },
     Error(String),
 }
@@ -281,6 +291,18 @@ fn handle(
             }
         },
         Command::Preview { path } => preview(events, &path),
+        Command::Thumb { path } => {
+            if let Ok(bytes) = fs::read(&path) {
+                if let Some((width, height, rgba)) = decode_image(&bytes) {
+                    let _ = events.send(Event::Thumb {
+                        path,
+                        width,
+                        height,
+                        rgba,
+                    });
+                }
+            }
+        }
     }
     true
 }
@@ -528,7 +550,7 @@ fn analyze(index: &mut Option<Index>, events: &Sender<Event>, path: PathBuf, req
         },
     );
     let arcs = sunburst(&weights);
-    let cells = laid
+    let cells: Vec<MapCell> = laid
         .into_iter()
         .enumerate()
         .map(|(index_cell, item)| {

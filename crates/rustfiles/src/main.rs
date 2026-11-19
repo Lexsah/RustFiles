@@ -1,8 +1,10 @@
 //! RustFiles — a cross-platform file manager with an Everything-style index.
 
 mod app;
+mod icons;
 mod nav;
 mod platform;
+mod theme;
 mod ui;
 mod worker;
 
@@ -26,16 +28,22 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     if let Ok(smoke) = std::env::var("RUSTFILES_SMOKE") {
-        if std::env::var_os("RUSTFILES_INDEX_PATHS").is_none() {
-            std::env::set_var("RUSTFILES_INDEX_PATHS", &smoke);
-        }
+        // The smoke directory is the whole index, even if a developer shell
+        // already pointed RUSTFILES_INDEX_PATHS somewhere else.
+        std::env::set_var("RUSTFILES_INDEX_PATHS", &smoke);
     }
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([860.0, 520.0])
+        .with_title("RustFiles")
+        .with_decorations(false);
+    // Real Mica needs a transparent window. Linux screenshots stay opaque so
+    // the solid Files fallback colors stay visible under Xvfb.
+    #[cfg(windows)]
+    let viewport = viewport.with_transparent(true);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([860.0, 520.0])
-            .with_title("RustFiles"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -46,7 +54,8 @@ fn main() -> eframe::Result {
 }
 
 impl eframe::App for app::RustFilesApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        apply_mica(self, frame);
         self.pump(ui.ctx());
         self.keys(ui.ctx());
         self.draw(ui);
@@ -55,6 +64,20 @@ impl eframe::App for app::RustFilesApp {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+fn apply_mica(app: &mut app::RustFilesApp, frame: &eframe::Frame) {
+    #[cfg(windows)]
+    if !app.mica_applied {
+        use raw_window_handle::HasWindowHandle as _;
+        if let Ok(handle) = frame.window_handle() {
+            app.mica_applied = window_vibrancy::apply_mica(handle, Some(app.dark)).is_ok();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, frame);
     }
 }
 

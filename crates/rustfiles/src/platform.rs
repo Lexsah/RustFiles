@@ -20,6 +20,7 @@ use rustfiles_core::{RawFile, UsnRecord};
 pub struct DetectedVolume {
     pub mount: String,
     pub label: String,
+    #[allow(dead_code)]
     pub fs_name: String,
     pub is_ntfs: bool,
     pub case_insensitive: bool,
@@ -124,6 +125,90 @@ pub fn detect_volumes() -> Vec<DetectedVolume> {
         }
     }
     detect_mounted_volumes()
+}
+
+/// `(total_bytes, available_bytes)` for the volume that contains `path`.
+pub fn disk_usage(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let text = path.to_string_lossy();
+        let c = std::ffi::CString::new(text.as_bytes()).ok()?;
+        let mut stat = unsafe { std::mem::zeroed::<libc::statvfs>() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        let total = stat.f_blocks.saturating_mul(stat.f_frsize as u64);
+        let free = stat.f_bavail.saturating_mul(stat.f_frsize as u64);
+        Some((total, free))
+    }
+    #[cfg(windows)]
+    {
+        windows::disk_usage(path)
+    }
+}
+
+/// Small system icon for a path. Windows uses the shell; other platforms use the icon theme.
+pub fn file_icon_rgba(path: &Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
+    #[cfg(windows)]
+    {
+        windows::shell_icon(path, is_dir)
+    }
+    #[cfg(not(windows))]
+    {
+        freedesktop_icon(path, is_dir)
+    }
+}
+
+#[cfg(not(windows))]
+fn freedesktop_icon(path: &Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
+    let name = if is_dir {
+        "folder"
+    } else {
+        match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" => "image-x-generic",
+            "mp3" | "flac" | "wav" | "ogg" => "audio-x-generic",
+            "mp4" | "mkv" | "webm" => "video-x-generic",
+            "txt" | "md" | "rs" | "json" | "toml" => "text-x-generic",
+            "pdf" => "application-pdf",
+            "zip" | "7z" | "tar" | "gz" => "package-x-generic",
+            _ => "text-x-generic",
+        }
+    };
+    for root in [
+        "/usr/share/icons/Adwaita/16x16",
+        "/usr/share/icons/Adwaita/22x22",
+        "/usr/share/icons/Humanity/places/16",
+        "/usr/share/icons/Humanity/mimes/16",
+        "/usr/share/icons/hicolor/16x16",
+    ] {
+        for sub in ["places", "mimetypes", "apps", ""] {
+            let candidate = if sub.is_empty() {
+                format!("{root}/{name}.png")
+            } else {
+                format!("{root}/{sub}/{name}.png")
+            };
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                if let Some(image) = decode_png_icon(&bytes) {
+                    return Some(image);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn decode_png_icon(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let rgba = image.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
 }
 
 pub fn volume_from_path(path: &str) -> DetectedVolume {
@@ -578,5 +663,123 @@ mod windows {
     fn utf16_buf(buf: &[u16]) -> String {
         let end = buf.iter().position(|unit| *unit == 0).unwrap_or(buf.len());
         String::from_utf16_lossy(&buf[..end])
+    }
+
+    pub fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide = wide(&path.display().to_string());
+        let mut available = 0u64;
+        let mut total = 0u64;
+        let ok =
+            unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, null_mut()) };
+        if ok == 0 {
+            None
+        } else {
+            Some((total, available))
+        }
+    }
+
+    pub fn shell_icon(path: &std::path::Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Graphics::Gdi::{
+            DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFOHEADER,
+            BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+        };
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+
+        let wide = wide(&path.display().to_string());
+        let mut info: SHFILEINFOW = unsafe { zeroed() };
+        let attr = if is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        let found = unsafe {
+            SHGetFileInfoW(
+                wide.as_ptr(),
+                attr,
+                &mut info,
+                size_of::<SHFILEINFOW>() as u32,
+                flags,
+            )
+        };
+        if found == 0 || info.hIcon.is_null() {
+            return None;
+        }
+        let mut icon: ICONINFO = unsafe { zeroed() };
+        if unsafe { GetIconInfo(info.hIcon, &mut icon) } == 0 {
+            unsafe { DestroyIcon(info.hIcon) };
+            return None;
+        }
+        let mut bitmap: BITMAP = unsafe { zeroed() };
+        let object = unsafe {
+            GetObjectW(
+                icon.hbmColor,
+                size_of::<BITMAP>() as i32,
+                &mut bitmap as *mut BITMAP as *mut _,
+            )
+        };
+        if object == 0 {
+            unsafe {
+                DeleteObject(icon.hbmColor);
+                DeleteObject(icon.hbmMask);
+                DestroyIcon(info.hIcon);
+            }
+            return None;
+        }
+        let width = bitmap.bmWidth.max(0) as u32;
+        let height = bitmap.bmHeight.unsigned_abs();
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            unsafe {
+                DeleteObject(icon.hbmColor);
+                DeleteObject(icon.hbmMask);
+                DestroyIcon(info.hIcon);
+            }
+            return None;
+        }
+        let mut header: BITMAPINFOHEADER = unsafe { zeroed() };
+        header.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        header.biWidth = width as i32;
+        header.biHeight = -(height as i32);
+        header.biPlanes = 1;
+        header.biBitCount = 32;
+        header.biCompression = BI_RGB;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let dc = unsafe { GetDC(std::ptr::null_mut()) };
+        let rows = unsafe {
+            GetDIBits(
+                dc,
+                icon.hbmColor,
+                0,
+                height,
+                pixels.as_mut_ptr() as *mut _,
+                &mut header as *mut BITMAPINFOHEADER as *mut _,
+                DIB_RGB_COLORS,
+            )
+        };
+        unsafe {
+            ReleaseDC(std::ptr::null_mut(), dc);
+            DeleteObject(icon.hbmColor);
+            DeleteObject(icon.hbmMask);
+            DestroyIcon(info.hIcon);
+        }
+        if rows == 0 {
+            return None;
+        }
+        // GDI gives BGRA. egui wants RGBA.
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+            if pixel[3] == 0 && (pixel[0] | pixel[1] | pixel[2]) != 0 {
+                pixel[3] = 255;
+            }
+        }
+        Some((width, height, pixels))
     }
 }
