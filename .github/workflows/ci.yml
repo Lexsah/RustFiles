@@ -49,15 +49,28 @@ jobs:
         run: |
           $shots = Join-Path (Get-Location) "windows-shots"
           $data = Join-Path $env:RUNNER_TEMP "rf-data"
-          New-Item -ItemType Directory -Force -Path $shots, $data | Out-Null
+          $mesa = Join-Path $env:RUNNER_TEMP "mesa"
+          New-Item -ItemType Directory -Force -Path $shots, $data, $mesa | Out-Null
           Set-Content -Path (Join-Path $data "hello.txt") -Value "hello"
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          Invoke-WebRequest -Uri "https://github.com/pal1000/mesa-dist-win/releases/download/26.3.0/mesa3d-26.3.0-release-msvc.7z" -OutFile $archive
+          & "C:\Program Files\7-Zip\7z.exe" x $archive "-o$mesa" -y
+          $bin = Join-Path (Get-Location) "target\debug"
+          foreach ($name in @("opengl32.dll", "libgallium_wgl.dll")) {
+            $dll = Get-ChildItem -Path $mesa -Recurse -Filter $name | Where-Object { $_.FullName -match '\\x64\\' } | Select-Object -First 1
+            if (-not $dll) { throw "Mesa $name for x64 was not in the archive" }
+            Copy-Item $dll.FullName (Join-Path $bin $name)
+          }
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $env:LIBGL_ALWAYS_SOFTWARE = "1"
           $env:RUSTFILES_OPEN = $data
           $env:RUSTFILES_INDEX_PATHS = $data
           $env:RUSTFILES_TOUR = $shots
           $env:RUSTFILES_SIZE = "1400x900"
           $log = Join-Path $shots "launch.txt"
-          & "target\debug\rustfiles.exe" *> $log
-          Get-Content $log
+          $proc = Start-Process -FilePath (Join-Path $bin "rustfiles.exe") -WorkingDirectory $bin -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $shots "stdout.txt") -RedirectStandardError $log
+          if (-not $proc.WaitForExit(90000)) { Stop-Process -Id $proc.Id -Force }
+          Get-Content $log -ErrorAction SilentlyContinue
           Get-ChildItem $shots | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
