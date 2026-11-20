@@ -40,6 +40,9 @@ fn main() -> eframe::Result {
     if let Some(path) = take_option(&args, "--qa-script") {
         std::env::set_var("RUSTFILES_QA", path);
     }
+    if let Some(dir) = take_option(&args, "--qa-out") {
+        std::env::set_var("RUSTFILES_QA_OUT", dir);
+    }
     if let Some(path) = positional(&args) {
         std::env::set_var("RUSTFILES_OPEN", path);
     }
@@ -113,7 +116,7 @@ impl eframe::App for app::RustFilesApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         apply_mica(self, frame, ui.ctx());
         if let Some(mut player) = self.qa.take() {
-            player.tick(self, ui.ctx());
+            player.prepare(self, ui.ctx());
             self.qa = Some(player);
         }
         if let Some(scale) = platform::window_scale() {
@@ -129,6 +132,10 @@ impl eframe::App for app::RustFilesApp {
             self.layout_log.clear();
         }
         self.draw(ui);
+        if let Some(mut player) = self.qa.take() {
+            player.finish_frame();
+            self.qa = Some(player);
+        }
         self.shot_step(ui.ctx());
         self.smoke_step(ui.ctx());
         if self.indexing {
@@ -205,7 +212,7 @@ fn positional(args: &[String]) -> Option<&String> {
             skip_value = false;
             continue;
         }
-        if arg == "--perf-report" || arg == "--qa-script" {
+        if arg == "--perf-report" || arg == "--qa-script" || arg == "--qa-out" {
             skip_value = true;
             continue;
         }

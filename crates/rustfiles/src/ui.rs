@@ -2346,6 +2346,7 @@ fn command_button_ex(
         );
     }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    crate::qa::register(label, response.id, response.rect);
     if show_label {
         response
     } else {
@@ -2407,6 +2408,7 @@ fn icon_button(
         color,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, tip));
+    crate::qa::register(tip, response.id, response.rect);
     response.on_hover_text(tip)
 }
 
@@ -2542,6 +2544,8 @@ fn section_header(
         FontId::proportional(14.0),
         palette.text,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
+    crate::qa::register(title, response.id, response.rect);
     *open
 }
 
@@ -2621,6 +2625,7 @@ fn nav_entry(
         }
     }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    crate::qa::register(label, response.id, response.rect);
     response
 }
 
@@ -2694,6 +2699,7 @@ fn nav_row(
         palette.text,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    crate::qa::register(label, response.id, response.rect);
     response
 }
 #[allow(dead_code)]
