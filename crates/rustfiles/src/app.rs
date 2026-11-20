@@ -67,7 +67,7 @@ impl Tab {
             hist_pos: 0,
             path,
             home,
-            view: ViewMode::Tiles,
+            view: ViewMode::Grid,
             sort: SortColumn::Name,
             ascending: true,
             selected: Vec::new(),
@@ -114,6 +114,9 @@ pub struct RustFilesApp {
     pub places: Places,
     pub volumes: Vec<DetectedVolume>,
     pub favorites: Vec<PathBuf>,
+    pub quick_pins: Vec<crate::platform::ShellPlace>,
+    pub cloud_roots: Vec<crate::platform::ShellPlace>,
+    pub wsl_distros: Vec<crate::platform::ShellPlace>,
     pub dark: bool,
     pub show_hidden: bool,
     pub show_preview: bool,
@@ -154,6 +157,9 @@ pub struct RustFilesApp {
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
     pub mica_log: String,
+    pub(crate) recent_rows: Vec<FileRow>,
+    pub(crate) recent_at: Option<Instant>,
+    disk_cache: HashMap<PathBuf, (u64, u64, Instant)>,
     pub system_accent: Option<egui::Color32>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub mica_armed: bool,
@@ -176,6 +182,7 @@ pub struct RustFilesApp {
     pub sort_menu: bool,
     pub group_menu: bool,
     pub layout_log: Vec<(String, [f32; 4])>,
+    pub(crate) qa: Option<crate::qa::Player>,
     pub shot_path: Option<PathBuf>,
     pub tour_dir: Option<PathBuf>,
     tour_stage: u8,
@@ -252,6 +259,9 @@ impl RustFilesApp {
             places,
             volumes: Vec::new(),
             favorites,
+            quick_pins: crate::platform::quick_pins(),
+            cloud_roots: crate::platform::cloud_roots(),
+            wsl_distros: crate::platform::wsl_distros(),
             dark: config.dark,
             show_hidden: config.show_hidden,
             show_preview: config.show_preview,
@@ -292,6 +302,9 @@ impl RustFilesApp {
             icon_tx,
             mica_applied: false,
             mica_log: String::new(),
+            recent_rows: Vec::new(),
+            recent_at: None,
+            disk_cache: HashMap::new(),
             system_accent: platform::system_accent()
                 .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
             mica_armed: false,
@@ -314,6 +327,7 @@ impl RustFilesApp {
             sort_menu: false,
             group_menu: false,
             layout_log: Vec::new(),
+            qa: crate::qa::Player::load(),
             shot_path: std::env::var("RUSTFILES_SHOT").ok().map(PathBuf::from),
             tour_dir: std::env::var("RUSTFILES_TOUR").ok().map(PathBuf::from),
             tour_stage: 0,
@@ -414,7 +428,7 @@ impl RustFilesApp {
         }
         let (icon_n, icon_bytes) = texture_bytes(&self.icons_tex);
         let (thumb_n, thumb_bytes) = texture_bytes(&self.thumbs);
-        let rss = platform::working_set_bytes();
+        let (rss, private) = platform::memory_counters();
         let entries = self
             .progress
             .index_entries
@@ -423,9 +437,11 @@ impl RustFilesApp {
             .progress
             .index_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
+        let per_entry = index_bytes.checked_div(entries).unwrap_or(0);
         lines.push_str(&format!(
-            "heap rss_mb={} index_entries={entries} index_mb={} icons={icon_n} icon_mb={} thumbs={thumb_n} thumb_mb={}\n",
+            "heap rss_mb={} private_mb={} index_entries={entries} index_mb={} bytes_per_entry={per_entry} icons={icon_n} icon_mb={} thumbs={thumb_n} thumb_mb={}\n",
             rss / (1024 * 1024),
+            private / (1024 * 1024),
             index_bytes / (1024 * 1024),
             icon_bytes / (1024 * 1024),
             thumb_bytes / (1024 * 1024),
@@ -453,6 +469,7 @@ impl RustFilesApp {
             Event::IndexReady { files, elapsed_ms } => {
                 self.indexed = files;
                 self.indexing = false;
+                platform::trim_working_set();
                 self.status = format!("Index ready: {files} entries in {elapsed_ms} ms");
                 self.request_list();
                 if self.pane == Pane::Analyzer {
@@ -752,6 +769,18 @@ impl RustFilesApp {
             Action::Escape => self.escape(),
             Action::Open => self.open_selection(),
         }
+    }
+
+    pub fn cached_usage(&mut self, path: &std::path::Path) -> (u64, u64) {
+        if let Some((total, free, at)) = self.disk_cache.get(path) {
+            if at.elapsed() < std::time::Duration::from_secs(30) {
+                return (*total, *free);
+            }
+        }
+        let usage = platform::disk_usage(path).unwrap_or((0, 0));
+        self.disk_cache
+            .insert(path.to_path_buf(), (usage.0, usage.1, Instant::now()));
+        usage
     }
 
     pub fn pin_folder(&mut self, path: PathBuf) {
@@ -1152,7 +1181,7 @@ impl RustFilesApp {
         if path.as_os_str().is_empty() {
             return;
         }
-        let px = px.clamp(16, 48);
+        let px = px.clamp(16, 256);
         let have = self.icon_px.get(path).copied().unwrap_or(0);
         if have >= px || !self.icon_asked.insert((path.to_path_buf(), px)) {
             return;
@@ -1422,7 +1451,7 @@ pub fn format_free(free: u64, total: u64, lang: crate::i18n::Lang) -> String {
     }
 }
 
-fn save_screenshot(path: &std::path::Path, image: &egui::ColorImage) {
+pub(crate) fn save_screenshot(path: &std::path::Path, image: &egui::ColorImage) {
     let mut bytes = Vec::with_capacity(image.pixels.len() * 4);
     for pixel in &image.pixels {
         bytes.extend_from_slice(&pixel.to_array());

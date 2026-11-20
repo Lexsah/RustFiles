@@ -20,16 +20,20 @@ pub const NO_PARENT: u32 = u32::MAX;
 pub const METHOD_WALK: u8 = 0;
 pub const METHOD_MFT: u8 = 1;
 
+/// 32 bytes. Names live in one arena. Children are a sibling list, not a
+/// `HashMap` of `Vec`s. File references are `id + 1` unless `file_refs` is filled.
 #[derive(Clone, Debug)]
 pub(crate) struct Entry {
     pub(crate) parent: u32,
+    pub(crate) name_start: u32,
+    pub(crate) first_child: u32,
+    pub(crate) next_sibling: u32,
     pub(crate) volume: u16,
     pub(crate) flags: u16,
-    pub(crate) file_ref: u64,
-    pub(crate) name_start: u32,
     pub(crate) name_len: u16,
-    pub(crate) size: u64,
-    pub(crate) modified: u64,
+    pub(crate) _pad: u16,
+    pub(crate) size_lo: u32,
+    pub(crate) modified: u32,
 }
 
 /// File-reference lookup. Record numbers that sit near the entry id live in a
@@ -103,8 +107,10 @@ pub struct Index {
     pub(crate) volumes: Vec<Volume>,
     pub(crate) entries: Vec<Entry>,
     pub(crate) names: Vec<u8>,
-    /// Only directories with children are present. Files do not pay for an empty `Vec`.
-    children: FxHashMap<u32, Vec<u32>>,
+    /// Empty when every `file_ref` is `id + 1` (the directory walk). Otherwise one `u64` per entry.
+    pub(crate) file_refs: Vec<u64>,
+    /// Files whose size does not fit in `u32`.
+    pub(crate) big_sizes: FxHashMap<u32, u64>,
     refs: Refs,
     trigrams: FxHashMap<u32, Vec<u32>>,
     trigrams_ready: bool,
@@ -217,11 +223,8 @@ impl IndexBuilder {
         self.index.rebuild_derived();
         self.index.entries.shrink_to_fit();
         self.index.names.shrink_to_fit();
-        self.index.next_file_ref = self
-            .index
-            .entries
-            .iter()
-            .map(|entry| entry.file_ref)
+        self.index.next_file_ref = (0..self.index.entries.len() as u32)
+            .map(|id| self.index.file_ref_at(id))
             .max()
             .unwrap_or(0)
             .saturating_add(1);
@@ -241,7 +244,8 @@ impl Index {
             volumes: Vec::new(),
             entries: Vec::new(),
             names: Vec::new(),
-            children: FxHashMap::default(),
+            file_refs: Vec::new(),
+            big_sizes: FxHashMap::default(),
             refs: Refs::new(),
             trigrams: FxHashMap::default(),
             trigrams_ready: false,
@@ -259,11 +263,8 @@ impl Index {
     pub fn resident_bytes(&self) -> usize {
         let mut total = self.entries.len() * std::mem::size_of::<Entry>();
         total += self.names.capacity();
-        total +=
-            self.children.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<Vec<u32>>());
-        for list in self.children.values() {
-            total += list.capacity() * std::mem::size_of::<u32>();
-        }
+        total += self.file_refs.capacity() * std::mem::size_of::<u64>();
+        total += self.big_sizes.capacity() * 16;
         total += self.refs.bytes();
         if self.trigrams_ready {
             total += self.trigrams.capacity() * 32;
@@ -406,16 +407,14 @@ impl Index {
                 continue;
             }
             count += 1;
-            if let Some(children) = self.children.get(&current) {
-                stack.extend(children.iter().copied());
-            }
+            stack.extend(self.child_ids(current));
         }
         count
     }
 
     pub fn list_dir(&mut self, id: u32, show_hidden: bool) -> Vec<FileRow> {
         self.ensure_sizes();
-        let children = self.children.get(&id).cloned().unwrap_or_default();
+        let children = self.child_ids(id);
         let mut rows = Vec::new();
         for child in children {
             if !self.alive(child) {
@@ -431,7 +430,7 @@ impl Index {
             let size = if is_dir {
                 self.sizes.get(child as usize).copied().unwrap_or(0)
             } else {
-                self.entries[child as usize].size
+                self.size_at(child as usize)
             };
             rows.push(FileRow {
                 name,
@@ -439,7 +438,7 @@ impl Index {
                 is_dir,
                 hidden,
                 size,
-                modified: self.entries[child as usize].modified,
+                modified: u64::from(self.entries[child as usize].modified),
             });
         }
         rows
@@ -474,16 +473,11 @@ impl Index {
                     state[id] = 1;
                     if is_dir {
                         let pending: Vec<usize> = self
-                            .children
-                            .get(&(id as u32))
-                            .map(|list| {
-                                list.iter()
-                                    .copied()
-                                    .map(|child| child as usize)
-                                    .filter(|child| *child < count && state[*child] == 0)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                            .child_ids(id as u32)
+                            .into_iter()
+                            .map(|child| child as usize)
+                            .filter(|child| *child < count && state[*child] == 0)
+                            .collect();
                         if !pending.is_empty() {
                             stack.extend(pending);
                             continue;
@@ -491,18 +485,11 @@ impl Index {
                     }
                 }
                 self.sizes[id] = if is_dir {
-                    self.children
-                        .get(&(id as u32))
-                        .map(|list| list.iter())
-                        .into_iter()
-                        .flatten()
-                        .fold(0u64, |sum, child| {
-                            sum.saturating_add(
-                                self.sizes.get(*child as usize).copied().unwrap_or(0),
-                            )
-                        })
+                    self.child_ids(id as u32).iter().fold(0u64, |sum, child| {
+                        sum.saturating_add(self.sizes.get(*child as usize).copied().unwrap_or(0))
+                    })
                 } else {
-                    self.entries[id].size
+                    self.size_at(id)
                 };
                 state[id] = 2;
                 stack.pop();
@@ -517,7 +504,7 @@ impl Index {
 
     pub fn child_weights(&mut self, id: u32) -> Vec<crate::analyze::Weighted> {
         self.ensure_sizes();
-        let children = self.children.get(&id).cloned().unwrap_or_default();
+        let children = self.child_ids(id);
         let mut items: Vec<_> = children
             .into_iter()
             .filter(|child| self.alive(*child))
@@ -527,7 +514,7 @@ impl Index {
                 size: self.folder_size(child).max(if self.is_dir(child) {
                     0
                 } else {
-                    self.entries[child as usize].size
+                    self.size_at(child as usize)
                 }),
             })
             .filter(|item| item.size > 0)
@@ -551,13 +538,13 @@ impl Index {
         let old_name = record.reason & USN_REASON_RENAME_OLD_NAME != 0;
         let create = record.reason & (USN_REASON_FILE_CREATE | USN_REASON_RENAME_NEW_NAME) != 0;
         if delete && !create {
-            if let Some(id) = self.refs.get(volume, record.file_ref) {
+            if let Some(id) = self.lookup_ref(volume, record.file_ref) {
                 self.tombstone_tree(id);
             }
             return;
         }
         if old_name && !create {
-            if let Some(id) = self.refs.get(volume, record.file_ref) {
+            if let Some(id) = self.lookup_ref(volume, record.file_ref) {
                 self.tombstone(id);
             }
         }
@@ -576,22 +563,22 @@ impl Index {
     }
 
     pub fn set_metadata(&mut self, volume: u16, file_ref: u64, size: u64, modified: u64) -> bool {
-        let Some(id) = self.refs.get(volume, file_ref) else {
+        let Some(id) = self.lookup_ref(volume, file_ref) else {
             return false;
         };
         if !self.alive(id) {
             return false;
         }
         if self.entries[id as usize].flags & DIRECTORY == 0 {
-            self.entries[id as usize].size = size;
+            self.set_size_at(id as usize, size);
         }
-        self.entries[id as usize].modified = modified;
+        self.entries[id as usize].modified = modified.min(u64::from(u32::MAX)) as u32;
         self.sizes_valid = false;
         true
     }
 
     pub fn path_for_ref(&self, volume: u16, file_ref: u64) -> Option<String> {
-        let id = self.refs.get(volume, file_ref)?;
+        let id = self.lookup_ref(volume, file_ref)?;
         if !self.alive(id) {
             return None;
         }
@@ -606,7 +593,7 @@ impl Index {
         }
         let volume = self.entries[dir as usize].volume;
         let insensitive = self.volumes[volume as usize].case_insensitive;
-        let existing = self.children.get(&dir).cloned().unwrap_or_default();
+        let existing = self.child_ids(dir);
         let mut used = vec![false; live.len()];
         for child in existing {
             if !self.alive(child) {
@@ -660,11 +647,10 @@ impl Index {
             self.set_name(id, &item.name);
             self.add_trigrams(id);
         }
-        let entry = &mut self.entries[id as usize];
-        entry.flags = flags;
-        entry.modified = item.modified;
+        self.entries[id as usize].flags = flags;
+        self.entries[id as usize].modified = item.modified.min(u64::from(u32::MAX)) as u32;
         if !item.is_dir {
-            entry.size = item.size;
+            self.set_size_at(id as usize, item.size);
         }
         self.sizes_valid = false;
     }
@@ -683,9 +669,9 @@ impl Index {
         let parent = if parent_ref == file_ref {
             NO_PARENT
         } else {
-            self.refs.get(volume, parent_ref).unwrap_or(NO_PARENT)
+            self.lookup_ref(volume, parent_ref).unwrap_or(NO_PARENT)
         };
-        if let Some(id) = self.refs.get(volume, file_ref) {
+        if let Some(id) = self.lookup_ref(volume, file_ref) {
             let was_dead = self.entries[id as usize].flags & TOMBSTONE != 0;
             self.clear_trigrams(id);
             let old_parent = self.entries[id as usize].parent;
@@ -693,16 +679,16 @@ impl Index {
                 self.detach(old_parent, id);
                 self.entries[id as usize].parent = parent;
                 if parent != NO_PARENT {
-                    self.children.entry(parent).or_default().push(id);
+                    self.link_child(parent, id);
                 }
             }
             self.set_name(id, name);
             self.entries[id as usize].flags = flags & !TOMBSTONE;
             if flags & DIRECTORY == 0 {
-                self.entries[id as usize].size = size;
+                self.set_size_at(id as usize, size);
             }
             if modified > 0 {
-                self.entries[id as usize].modified = modified;
+                self.entries[id as usize].modified = modified.min(u64::from(u32::MAX)) as u32;
             }
             self.add_trigrams(id);
             self.sizes_valid = false;
@@ -737,20 +723,31 @@ impl Index {
     ) -> u32 {
         let id = self.entries.len() as u32;
         let (name_start, name_len) = push_str(&mut self.names, name);
+        let size_lo = if size > u64::from(u32::MAX) {
+            self.big_sizes.insert(id, size);
+            u32::MAX
+        } else {
+            size as u32
+        };
+        self.file_refs.push(file_ref);
         self.entries.push(Entry {
             parent,
+            name_start,
+            first_child: NO_PARENT,
+            next_sibling: NO_PARENT,
             volume,
             flags: flags & !TOMBSTONE,
-            file_ref,
-            name_start,
             name_len,
-            size,
-            modified,
+            _pad: 0,
+            size_lo,
+            modified: modified.min(u64::from(u32::MAX)) as u32,
         });
         if parent != NO_PARENT && (parent as usize) < self.entries.len() - 1 {
-            self.children.entry(parent).or_default().push(id);
+            self.link_child(parent, id);
         }
-        self.refs.insert(volume, file_ref, id);
+        if !(file_ref == u64::from(id) + 1 && self.file_refs.len() == self.entries.len()) {
+            self.refs.insert(volume, file_ref, id);
+        }
         self.add_trigrams(id);
         if file_ref >= self.next_file_ref {
             self.next_file_ref = file_ref.saturating_add(1);
@@ -778,9 +775,7 @@ impl Index {
                 continue;
             }
             order.push(current);
-            if let Some(children) = self.children.get(&current) {
-                stack.extend(children.iter().copied());
-            }
+            stack.extend(self.child_ids(current));
         }
         for current in order.into_iter().rev() {
             self.tombstone(current);
@@ -788,55 +783,167 @@ impl Index {
     }
 
     fn detach(&mut self, parent: u32, child: u32) {
-        if let Some(list) = self.children.get_mut(&parent) {
-            list.retain(|id| *id != child);
-        }
+        self.unlink_child(parent, child);
     }
 
     fn lookup_ref(&self, volume: u16, file_ref: u64) -> Option<u32> {
-        self.refs.get(volume, file_ref)
+        if let Some(id) = self.refs.get(volume, file_ref) {
+            return Some(id);
+        }
+        if file_ref == 0 {
+            return None;
+        }
+        let id = (file_ref - 1) as u32;
+        if (id as usize) < self.entries.len()
+            && self.file_ref_at(id) == file_ref
+            && self.entries[id as usize].volume == volume
+        {
+            return Some(id);
+        }
+        None
     }
 
     fn remember_ref(&mut self, volume: u16, file_ref: u64, id: u32) {
         self.refs.insert(volume, file_ref, id);
     }
 
+    pub(crate) fn file_ref_at(&self, id: u32) -> u64 {
+        self.file_refs
+            .get(id as usize)
+            .copied()
+            .unwrap_or(u64::from(id) + 1)
+    }
+
+    pub(crate) fn size_at(&self, id: usize) -> u64 {
+        self.big_sizes
+            .get(&(id as u32))
+            .copied()
+            .unwrap_or(u64::from(self.entries[id].size_lo))
+    }
+
+    fn set_size_at(&mut self, id: usize, size: u64) {
+        if size > u64::from(u32::MAX) {
+            self.big_sizes.insert(id as u32, size);
+            self.entries[id].size_lo = u32::MAX;
+        } else {
+            self.big_sizes.remove(&(id as u32));
+            self.entries[id].size_lo = size as u32;
+        }
+    }
+
+    fn child_ids(&self, parent: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let Some(entry) = self.entries.get(parent as usize) else {
+            return out;
+        };
+        let mut child = entry.first_child;
+        let mut guard = 0u32;
+        while child != NO_PARENT && (child as usize) < self.entries.len() && guard < 1_000_000 {
+            out.push(child);
+            child = self.entries[child as usize].next_sibling;
+            guard += 1;
+        }
+        out
+    }
+
+    fn link_child(&mut self, parent: u32, child: u32) {
+        if parent == NO_PARENT || (parent as usize) >= self.entries.len() {
+            return;
+        }
+        let next = self.entries[parent as usize].first_child;
+        self.entries[child as usize].next_sibling = next;
+        self.entries[parent as usize].first_child = child;
+    }
+
+    fn unlink_child(&mut self, parent: u32, child: u32) {
+        if (parent as usize) >= self.entries.len() {
+            return;
+        }
+        let mut prev = NO_PARENT;
+        let mut current = self.entries[parent as usize].first_child;
+        let mut guard = 0u32;
+        while current != NO_PARENT && guard < 1_000_000 {
+            let next = self.entries[current as usize].next_sibling;
+            if current == child {
+                if prev == NO_PARENT {
+                    self.entries[parent as usize].first_child = next;
+                } else {
+                    self.entries[prev as usize].next_sibling = next;
+                }
+                self.entries[child as usize].next_sibling = NO_PARENT;
+                return;
+            }
+            prev = current;
+            current = next;
+            guard += 1;
+        }
+    }
+
     fn push_entry(&mut self, volume: u16, file: &RawFile, parent: u32) {
         let (name_start, name_len) = push_str(&mut self.names, &file.name);
+        let size_lo = if file.size > u64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            file.size as u32
+        };
+        let id = self.entries.len() as u32;
+        if file.size > u64::from(u32::MAX) {
+            self.big_sizes.insert(id, file.size);
+        }
+        self.file_refs.push(file.file_ref);
         self.entries.push(Entry {
             parent,
+            name_start,
+            first_child: NO_PARENT,
+            next_sibling: NO_PARENT,
             volume,
             flags: file.flags,
-            file_ref: file.file_ref,
-            name_start,
             name_len,
-            size: file.size,
-            modified: file.modified,
+            _pad: 0,
+            size_lo,
+            modified: file.modified.min(u64::from(u32::MAX)) as u32,
         });
     }
 
     pub(crate) fn rebuild_derived(&mut self) {
         let count = self.entries.len();
-        self.children.clear();
         self.refs.clear();
         self.trigrams.clear();
         self.trigrams_ready = false;
+        for entry in &mut self.entries {
+            entry.first_child = NO_PARENT;
+            entry.next_sibling = NO_PARENT;
+        }
+        let identity = self.file_refs.len() == count
+            && self
+                .file_refs
+                .iter()
+                .enumerate()
+                .all(|(index, file_ref)| *file_ref == index as u64 + 1);
         for index in 0..count {
             if self.entries[index].flags & TOMBSTONE != 0 {
                 continue;
             }
             let volume = self.entries[index].volume;
-            let file_ref = self.entries[index].file_ref;
+            let file_ref = self.file_ref_at(index as u32);
             let parent = self.entries[index].parent;
-            self.refs.insert(volume, file_ref, index as u32);
+            if !identity {
+                self.refs.insert(volume, file_ref, index as u32);
+            }
             if parent != NO_PARENT
                 && (parent as usize) < count
                 && parent as usize != index
                 && self.entries[parent as usize].flags & TOMBSTONE == 0
             {
-                self.children.entry(parent).or_default().push(index as u32);
+                self.link_child(parent, index as u32);
             }
         }
+        if identity {
+            self.file_refs.clear();
+            self.file_refs.shrink_to_fit();
+        }
+        self.entries.shrink_to_fit();
+        self.names.shrink_to_fit();
         self.sizes_valid = false;
         self.sizes.clear();
     }
@@ -891,16 +998,14 @@ impl Index {
             name: self.name_of(id).to_string(),
             path: self.path(id),
             is_dir: entry.flags & DIRECTORY != 0,
-            size: entry.size,
-            modified: entry.modified,
+            size: self.size_at(id as usize),
+            modified: u64::from(entry.modified),
         }
     }
 
     fn child_named(&self, parent: u32, name: &str, insensitive: bool) -> Option<u32> {
-        let children = self.children.get(&parent)?;
-        children
-            .iter()
-            .copied()
+        self.child_ids(parent)
+            .into_iter()
             .find(|id| self.alive(*id) && names_equal(self.name_of(*id), name, insensitive))
     }
 
@@ -1222,6 +1327,15 @@ mod tests {
         builder.add_file(volume, raw(6, 1, "abc", 1, 0));
         builder.add_file(volume, raw(7, 1, ".secret", 2, HIDDEN));
         builder.finish()
+    }
+
+    #[test]
+    fn entry_record_stays_within_32_bytes() {
+        assert!(
+            std::mem::size_of::<Entry>() <= 32,
+            "{}",
+            std::mem::size_of::<Entry>()
+        );
     }
 
     #[test]

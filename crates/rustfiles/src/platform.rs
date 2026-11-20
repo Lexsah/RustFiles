@@ -49,6 +49,45 @@ pub struct Places {
     pub videos: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct ShellPlace {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+pub fn quick_pins() -> Vec<ShellPlace> {
+    #[cfg(windows)]
+    {
+        windows::quick_pins()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+pub fn cloud_roots() -> Vec<ShellPlace> {
+    #[cfg(windows)]
+    {
+        windows::cloud_roots()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+pub fn wsl_distros() -> Vec<ShellPlace> {
+    #[cfg(windows)]
+    {
+        windows::wsl_distros()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 pub fn places() -> Places {
     let home = home_dir();
     let places = Places {
@@ -186,14 +225,50 @@ pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
     }
 }
 
+/// `WS_EX_NOREDIRECTIONBITMAP` is only honored at CreateWindow time.
+/// A CBT hook adds it to the CREATESTRUCT before winit's window exists.
+pub fn arm_noredir_hook() {
+    #[cfg(windows)]
+    windows::arm_noredir_hook();
+}
+
 /// Overwrite `%TEMP%/rustfiles-mica.log` and echo the line. The GUI has no console.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn write_diag(line: &str) {
-    eprintln!("{line}");
+    // Release builds have no console. Keep the line in the log file only.
     let path = std::env::temp_dir().join("rustfiles-mica.log");
-    let _ = std::fs::write(path, format!("{line}\n"));
+    let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(line);
+    existing.push('\n');
+    let _ = std::fs::write(path, existing);
 }
 
+pub fn trim_working_set() {
+    #[cfg(windows)]
+    windows::trim_working_set();
+}
+
+/// `(working set, private bytes)`.
+pub fn memory_counters() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        windows::memory_counters()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let rss = linux_working_set_bytes();
+        (rss, rss)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        (0, 0)
+    }
+}
+
+#[allow(dead_code)]
 pub fn working_set_bytes() -> u64 {
     #[cfg(windows)]
     {
@@ -893,6 +968,41 @@ mod windows {
         String::from_utf16_lossy(&buf[..end])
     }
 
+    pub fn quick_pins() -> Vec<super::ShellPlace> {
+        shell_namespace("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}")
+    }
+
+    pub fn cloud_roots() -> Vec<super::ShellPlace> {
+        let mut places = reg_sync_roots();
+        let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+        let Some(home) = home else {
+            return places;
+        };
+        for (name, folder) in [
+            ("Nextcloud", "Nextcloud"),
+            ("Proton Drive", "Proton Drive"),
+            ("Dropbox", "Dropbox"),
+            ("Google Drive", "Google Drive"),
+            ("iCloud Drive", "iCloudDrive"),
+            ("OneDrive", "OneDrive"),
+            ("Box", "Box"),
+            ("MEGA", "MEGA"),
+        ] {
+            let path = home.join(folder);
+            if path.is_dir() && !places.iter().any(|place| place.path == path) {
+                places.push(super::ShellPlace {
+                    name: name.to_string(),
+                    path,
+                });
+            }
+        }
+        places
+    }
+
+    pub fn wsl_distros() -> Vec<super::ShellPlace> {
+        reg_wsl()
+    }
+
     pub fn disk_usage(path: &std::path::Path) -> Option<(u64, u64)> {
         use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
         let wide = wide(&path.display().to_string());
@@ -907,6 +1017,302 @@ mod windows {
         }
     }
 
+    fn jumbo_icon(index: i32) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::HICON> {
+        use windows_sys::Win32::UI::Shell::SHGetImageList;
+        use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
+        let iid = windows_sys::core::GUID {
+            data1: 0x46eb_5926,
+            data2: 0x582e,
+            data3: 0x4017,
+            data4: [0x9f, 0xdf, 0xe8, 0x99, 0x8d, 0xaa, 0x09, 0x50],
+        };
+        let mut list: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = unsafe { SHGetImageList(4, &iid, &mut list) };
+        if hr < 0 || list.is_null() {
+            return None;
+        }
+        let vtbl = unsafe { *(list as *mut *mut usize) };
+        type GetIcon =
+            unsafe extern "system" fn(*mut std::ffi::c_void, i32, u32, *mut HICON) -> i32;
+        type Release = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+        let get_icon: GetIcon = unsafe { std::mem::transmute(*vtbl.add(10)) };
+        let release: Release = unsafe { std::mem::transmute(*vtbl.add(2)) };
+        let mut icon: HICON = std::ptr::null_mut();
+        let hr = unsafe { get_icon(list, index, 1, &mut icon) };
+        unsafe { release(list) };
+        if hr < 0 || icon.is_null() {
+            None
+        } else {
+            Some(icon)
+        }
+    }
+
+    fn shell_namespace(display: &str) -> Vec<super::ShellPlace> {
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::Common::STRRET;
+        use windows_sys::Win32::UI::Shell::{
+            SHGetDesktopFolder, StrRetToBufW, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN,
+            SHCONTF_NONFOLDERS, SHGDN_FORPARSING,
+        };
+        unsafe {
+            let mut desktop: *mut std::ffi::c_void = std::ptr::null_mut();
+            if SHGetDesktopFolder(&mut desktop) < 0 || desktop.is_null() {
+                return Vec::new();
+            }
+            let desktop_vt = *(desktop as *mut *mut usize);
+            type Parse = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const u16,
+                *mut u32,
+                *mut *mut std::ffi::c_void,
+                *mut u32,
+            ) -> i32;
+            type Bind = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const windows_sys::core::GUID,
+                *mut *mut std::ffi::c_void,
+            ) -> i32;
+            type Release = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+            let parse: Parse = std::mem::transmute(*desktop_vt.add(3));
+            let bind: Bind = std::mem::transmute(*desktop_vt.add(5));
+            let release: Release = std::mem::transmute(*desktop_vt.add(2));
+            let wide = wide(display);
+            let mut eaten = 0u32;
+            let mut pidl: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut attrs = 0u32;
+            let hr = parse(
+                desktop,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                wide.as_ptr(),
+                &mut eaten,
+                &mut pidl,
+                &mut attrs,
+            );
+            if hr < 0 || pidl.is_null() {
+                release(desktop);
+                return Vec::new();
+            }
+            let iid = windows_sys::core::GUID {
+                data1: 0x0002_140e,
+                data2: 0x0000,
+                data3: 0x0000,
+                data4: [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+            };
+            let mut folder: *mut std::ffi::c_void = std::ptr::null_mut();
+            let hr = bind(desktop, pidl, std::ptr::null_mut(), &iid, &mut folder);
+            release(desktop);
+            CoTaskMemFree(pidl);
+            if hr < 0 || folder.is_null() {
+                return Vec::new();
+            }
+            let folder_vt = *(folder as *mut *mut usize);
+            type EnumObjects = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                u32,
+                *mut *mut std::ffi::c_void,
+            ) -> i32;
+            type GetName = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+                u32,
+                *mut STRRET,
+            ) -> i32;
+            let enum_objects: EnumObjects = std::mem::transmute(*folder_vt.add(4));
+            let get_name: GetName = std::mem::transmute(*folder_vt.add(11));
+            let release_folder: Release = std::mem::transmute(*folder_vt.add(2));
+            let mut enumerator: *mut std::ffi::c_void = std::ptr::null_mut();
+            let flags = (SHCONTF_FOLDERS | SHCONTF_NONFOLDERS | SHCONTF_INCLUDEHIDDEN) as u32;
+            if enum_objects(folder, std::ptr::null_mut(), flags, &mut enumerator) < 0
+                || enumerator.is_null()
+            {
+                release_folder(folder);
+                return Vec::new();
+            }
+            let enum_vt = *(enumerator as *mut *mut usize);
+            type Next = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                u32,
+                *mut *mut std::ffi::c_void,
+                *mut u32,
+            ) -> i32;
+            let next: Next = std::mem::transmute(*enum_vt.add(3));
+            let release_enum: Release = std::mem::transmute(*enum_vt.add(2));
+            let mut places = Vec::new();
+            for _ in 0..64 {
+                let mut child: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut fetched = 0u32;
+                if next(enumerator, 1, &mut child, &mut fetched) != 0 || child.is_null() {
+                    break;
+                }
+                let mut name: STRRET = std::mem::zeroed();
+                if get_name(folder, child, SHGDN_FORPARSING, &mut name) >= 0 {
+                    let mut buf = [0u16; 1024];
+                    if StrRetToBufW(
+                        &mut name,
+                        child as *const windows_sys::Win32::UI::Shell::Common::ITEMIDLIST,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    ) >= 0
+                    {
+                        let text = utf16_buf(&buf);
+                        if !text.is_empty() && !text.starts_with("::") {
+                            let path = std::path::PathBuf::from(&text);
+                            let label = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or(text);
+                            places.push(super::ShellPlace { name: label, path });
+                        }
+                    }
+                }
+                CoTaskMemFree(child);
+            }
+            release_enum(enumerator);
+            release_folder(folder);
+            places
+        }
+    }
+
+    fn reg_sync_roots() -> Vec<super::ShellPlace> {
+        let root = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SyncRootManager";
+        let mut places = Vec::new();
+        for key in reg_subkeys(root) {
+            let display = reg_sz(&format!("{root}\\{key}"), "DisplayNameResource")
+                .filter(|name| !name.starts_with('@') && !name.is_empty());
+            let users = format!("{root}\\{key}\\UserSyncRoots");
+            for value in reg_values(&users) {
+                if value.starts_with("\\\\") || value.contains(":\\") {
+                    let path = std::path::PathBuf::from(&value);
+                    let name = display.clone().unwrap_or_else(|| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| key.clone())
+                    });
+                    places.push(super::ShellPlace { name, path });
+                }
+            }
+        }
+        places
+    }
+
+    fn reg_wsl() -> Vec<super::ShellPlace> {
+        let root = "Software\\Microsoft\\Windows\\CurrentVersion\\Lxss";
+        let mut places = Vec::new();
+        for key in reg_subkeys(root) {
+            let Some(name) = reg_sz(&format!("{root}\\{key}"), "DistributionName") else {
+                continue;
+            };
+            places.push(super::ShellPlace {
+                path: std::path::PathBuf::from(format!("\\\\wsl.localhost\\{name}")),
+                name,
+            });
+        }
+        places
+    }
+
+    fn reg_subkeys(path: &str) -> Vec<String> {
+        use windows_sys::Win32::System::Registry::{
+            RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ,
+        };
+        let wide = wide(path);
+        let mut key = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            return Vec::new();
+        }
+        let mut names = Vec::new();
+        for index in 0..64u32 {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let status = unsafe {
+                RegEnumKeyExW(
+                    key,
+                    index,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != 0 {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        unsafe { RegCloseKey(key) };
+        names
+    }
+
+    fn reg_sz(path: &str, name: &str) -> Option<String> {
+        reg_values_named(path)
+            .into_iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    fn reg_values(path: &str) -> Vec<String> {
+        reg_values_named(path)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    fn reg_values_named(path: &str) -> Vec<(String, String)> {
+        use windows_sys::Win32::System::Registry::{
+            RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_READ, REG_SZ,
+        };
+        let wide = wide(path);
+        let mut key = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
+        for index in 0..32u32 {
+            let mut name = [0u16; 256];
+            let mut name_len = name.len() as u32;
+            let mut kind = 0u32;
+            let mut data = [0u8; 1024];
+            let mut data_len = data.len() as u32;
+            let status = unsafe {
+                RegEnumValueW(
+                    key,
+                    index,
+                    name.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    data.as_mut_ptr(),
+                    &mut data_len,
+                )
+            };
+            if status != 0 {
+                break;
+            }
+            if kind != REG_SZ {
+                continue;
+            }
+            let bytes = &data[..data_len as usize];
+            let units: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .take_while(|unit| *unit != 0)
+                .collect();
+            let label = String::from_utf16_lossy(&name[..name_len as usize]);
+            values.push((label, String::from_utf16_lossy(&units)));
+        }
+        unsafe { RegCloseKey(key) };
+        values
+    }
+
     pub fn shell_icon(path: &std::path::Path, is_dir: bool) -> Option<(u32, u32, Vec<u8>)> {
         use std::mem::{size_of, zeroed};
         use windows_sys::Win32::Graphics::Gdi::{
@@ -917,7 +1323,7 @@ mod windows {
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         };
         use windows_sys::Win32::UI::Shell::{
-            SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+            SHGetFileInfoW, SHFILEINFOW, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
@@ -928,7 +1334,7 @@ mod windows {
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-        let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        let flags = SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES;
         let found = unsafe {
             SHGetFileInfoW(
                 wide.as_ptr(),
@@ -938,9 +1344,11 @@ mod windows {
                 flags,
             )
         };
-        if found == 0 || info.hIcon.is_null() {
+        if found == 0 || info.iIcon < 0 {
             return None;
         }
+        let hicon = jumbo_icon(info.iIcon)?;
+        info.hIcon = hicon;
         let mut icon: ICONINFO = unsafe { zeroed() };
         if unsafe { GetIconInfo(info.hIcon, &mut icon) } == 0 {
             unsafe { DestroyIcon(info.hIcon) };
@@ -1070,6 +1478,38 @@ mod windows {
     /// system backdrop, which is why the window stayed flat `#1c1c1c`.
     /// winit's transparent flag also enables blur-behind, and that conflicts
     /// with `DWMWA_SYSTEMBACKDROP_TYPE`, so blur-behind is turned off first.
+    pub fn arm_noredir_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CallNextHookEx, SetWindowsHookExW, CBT_CREATEWNDW, HCBT_CREATEWND, WH_CBT,
+            WS_EX_NOREDIRECTIONBITMAP,
+        };
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        if ARMED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if code as u32 == HCBT_CREATEWND && lparam != 0 {
+                let cbt = &*(lparam as *const CBT_CREATEWNDW);
+                if !cbt.lpcs.is_null() {
+                    let create = &mut *cbt.lpcs;
+                    create.dwExStyle |= WS_EX_NOREDIRECTIONBITMAP;
+                }
+            }
+            CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+        }
+        unsafe {
+            let _ = SetWindowsHookExW(
+                WH_CBT,
+                Some(hook),
+                std::ptr::null_mut(),
+                GetCurrentThreadId(),
+            );
+        }
+    }
+
     pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
         use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
         use windows_sys::Win32::Graphics::Dwm::{
@@ -1120,7 +1560,8 @@ mod windows {
                 GWL_EXSTYLE,
                 ex_style | WS_EX_NOREDIRECTIONBITMAP as i32,
             );
-            let noredir = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP as i32 != 0;
+            let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            let noredir = (style & WS_EX_NOREDIRECTIONBITMAP as i32) != 0;
             let dark_mode = u32::from(dark);
             let dark_hr = DwmSetWindowAttribute(
                 hwnd,
@@ -1154,8 +1595,38 @@ mod windows {
             let alpha =
                 std::env::var("RUSTFILES_ALPHA_SURFACE").unwrap_or_else(|_| "unknown".into());
             format!(
-                "mica: hr={hr:#010x} alpha_surface={alpha} blur={blur_hr:#010x} dark={dark_hr:#010x} extend={extend_hr:#010x} noredir={noredir}"
+                "mica: hr={hr:#010x} alpha_surface={alpha} presentation=DxgiFromVisual blur={blur_hr:#010x} dark={dark_hr:#010x} extend={extend_hr:#010x} noredir={noredir}"
             )
+        }
+    }
+
+    pub fn trim_working_set() {
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let _ = K32EmptyWorkingSet(GetCurrentProcess());
+        }
+    }
+
+    pub fn memory_counters() -> (u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                ..std::mem::zeroed()
+            };
+            if GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut _,
+                counters.cb,
+            ) == 0
+            {
+                return (0, 0);
+            }
+            (counters.WorkingSetSize as u64, counters.PrivateUsage as u64)
         }
     }
 
@@ -1217,18 +1688,33 @@ mod windows {
         let get_image: GetImage = unsafe { std::mem::transmute(*vtbl.add(3)) };
         let release: Release = unsafe { std::mem::transmute(*vtbl.add(2)) };
         let mut bitmap: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SIIGBF_BIGGERSIZEOK: thumbnail when the shell has one, otherwise the icon.
-        let hr = unsafe {
+        // Thumbnail only first (SIIGBF_THUMBNAILONLY | BIGGERSIZEOK | CROPTOSQUARE).
+        // Fall back to the icon at the same edge, without SCALEUP, so a 32px
+        // glyph is never stretched.
+        let mut hr = unsafe {
             get_image(
                 unknown,
                 SIZE {
                     cx: edge as i32,
                     cy: edge as i32,
                 },
-                0x1,
+                0x08 | 0x01 | 0x20,
                 &mut bitmap,
             )
         };
+        if hr < 0 || bitmap.is_null() {
+            hr = unsafe {
+                get_image(
+                    unknown,
+                    SIZE {
+                        cx: edge as i32,
+                        cy: edge as i32,
+                    },
+                    0x04 | 0x01,
+                    &mut bitmap,
+                )
+            };
+        }
         unsafe { release(unknown) };
         if hr < 0 || bitmap.is_null() {
             return None;
