@@ -153,7 +153,7 @@ jobs:
           mkdir -p upload
           [ -f rustfiles-linux-x86_64.tar.gz ] && cp rustfiles-linux-x86_64.tar.gz upload/
           [ -f rustfiles-windows-x86_64.zip ] && cp rustfiles-windows-x86_64.zip upload/
-          [ -f dist/RustFiles-0.3.8-Setup.exe ] && cp dist/RustFiles-0.3.8-Setup.exe upload/
+          [ -f dist/RustFiles-0.3.9-Setup.exe ] && cp dist/RustFiles-0.3.9-Setup.exe upload/
           ls -la upload
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

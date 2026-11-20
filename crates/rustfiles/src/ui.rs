@@ -84,9 +84,9 @@ impl RustFilesApp {
         };
         // The file area is a separate, nearly opaque card over the Mica chrome.
         let file_fill = if self.dark {
-            Color32::from_rgba_unmultiplied(44, 44, 44, 248)
+            Color32::from_rgba_unmultiplied(32, 32, 32, 196)
         } else {
-            Color32::from_rgba_unmultiplied(252, 252, 252, 248)
+            Color32::from_rgba_unmultiplied(252, 252, 252, 210)
         };
         let file_radius = CornerRadius {
             nw: 12,
@@ -438,7 +438,7 @@ impl RustFilesApp {
             true,
             palette.accent,
         );
-        if new_button.clicked() {
+        if crate::qa::consume(self.tr.new, new_button.clicked()) {
             self.new_menu = !self.new_menu;
         }
         let new_pos = new_button.rect.left_bottom();
@@ -499,17 +499,17 @@ impl RustFilesApp {
             (layout_button, sort_button, group_button)
         });
         let (layout_button, sort_button, group_button) = layout_button.inner;
-        if layout_button.clicked() {
+        if crate::qa::consume(self.tr.layout, layout_button.clicked()) {
             self.layout_menu = !self.layout_menu;
             self.sort_menu = false;
             self.group_menu = false;
         }
-        if sort_button.clicked() {
+        if crate::qa::consume(self.tr.sort, sort_button.clicked()) {
             self.sort_menu = !self.sort_menu;
             self.group_menu = false;
             self.layout_menu = false;
         }
-        if group_button.clicked() {
+        if crate::qa::consume(self.tr.group, group_button.clicked()) {
             self.group_menu = !self.group_menu;
             self.sort_menu = false;
             self.layout_menu = false;
@@ -599,7 +599,8 @@ impl RustFilesApp {
         ScrollArea::vertical()
             .id_salt("sidebar")
             .show(&mut side, |side| {
-                if nav_row(side, icons::HOME, self.tr.home, self.tab().home, palette).clicked() {
+                let home = nav_row(side, icons::HOME, self.tr.home, self.tab().home, palette);
+                if crate::qa::consume(self.tr.home, home.clicked()) {
                     self.show_home();
                 }
                 let places = self.places.clone();
@@ -829,7 +830,7 @@ impl RustFilesApp {
                 let mount = PathBuf::from(&volume.mount);
                 self.request_icon(&mount, 32);
                 let icon = self.icons_tex.get(&mount).cloned();
-                let (total, free) = platform::disk_usage(&mount).unwrap_or((0, 0));
+                let (total, free) = self.cached_usage(&mount);
                 let title = drive_title(&volume.label, &volume.mount, self.lang);
                 if drive_card(
                     ui,
@@ -854,7 +855,14 @@ impl RustFilesApp {
                 .size(18.0),
         );
         ui.add_space(8.0);
-        let recent = recent_files(&self.places);
+        if self
+            .recent_at
+            .is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(30))
+        {
+            self.recent_rows = recent_files(&self.places);
+            self.recent_at = Some(std::time::Instant::now());
+        }
+        let recent = self.recent_rows.clone();
         if recent.is_empty() {
             ui.label(RichText::new(self.tr.no_recent).color(palette.text_secondary));
             return;
@@ -2337,6 +2345,7 @@ fn command_button_ex(
             palette.text,
         );
     }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if show_label {
         response
     } else {
@@ -2397,6 +2406,7 @@ fn icon_button(
         icon_font(16.0),
         color,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, tip));
     response.on_hover_text(tip)
 }
 
@@ -2610,6 +2620,7 @@ fn nav_entry(
             }
         }
     }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     response
 }
 
@@ -2682,6 +2693,7 @@ fn nav_row(
         FontId::proportional(14.0),
         palette.text,
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     response
 }
 #[allow(dead_code)]

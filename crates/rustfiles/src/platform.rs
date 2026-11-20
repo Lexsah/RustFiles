@@ -186,6 +186,13 @@ pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
     }
 }
 
+/// `WS_EX_NOREDIRECTIONBITMAP` is only honored at CreateWindow time.
+/// A CBT hook adds it to the CREATESTRUCT before winit's window exists.
+pub fn arm_noredir_hook() {
+    #[cfg(windows)]
+    windows::arm_noredir_hook();
+}
+
 /// Overwrite `%TEMP%/rustfiles-mica.log` and echo the line. The GUI has no console.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn write_diag(line: &str) {
@@ -194,6 +201,29 @@ pub fn write_diag(line: &str) {
     let _ = std::fs::write(path, format!("{line}\n"));
 }
 
+pub fn trim_working_set() {
+    #[cfg(windows)]
+    windows::trim_working_set();
+}
+
+/// `(working set, private bytes)`.
+pub fn memory_counters() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        windows::memory_counters()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let rss = linux_working_set_bytes();
+        (rss, rss)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        (0, 0)
+    }
+}
+
+#[allow(dead_code)]
 pub fn working_set_bytes() -> u64 {
     #[cfg(windows)]
     {
@@ -1070,6 +1100,38 @@ mod windows {
     /// system backdrop, which is why the window stayed flat `#1c1c1c`.
     /// winit's transparent flag also enables blur-behind, and that conflicts
     /// with `DWMWA_SYSTEMBACKDROP_TYPE`, so blur-behind is turned off first.
+    pub fn arm_noredir_hook() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CallNextHookEx, SetWindowsHookExW, CBT_CREATEWNDW, HCBT_CREATEWND, WH_CBT,
+            WS_EX_NOREDIRECTIONBITMAP,
+        };
+        static ARMED: AtomicBool = AtomicBool::new(false);
+        if ARMED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if code as u32 == HCBT_CREATEWND && lparam != 0 {
+                let cbt = &*(lparam as *const CBT_CREATEWNDW);
+                if !cbt.lpcs.is_null() {
+                    let create = &mut *cbt.lpcs;
+                    create.dwExStyle |= WS_EX_NOREDIRECTIONBITMAP as u32;
+                }
+            }
+            CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+        }
+        unsafe {
+            let _ = SetWindowsHookExW(
+                WH_CBT,
+                Some(hook),
+                std::ptr::null_mut(),
+                GetCurrentThreadId(),
+            );
+        }
+    }
+
     pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
         use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
         use windows_sys::Win32::Graphics::Dwm::{
@@ -1120,7 +1182,8 @@ mod windows {
                 GWL_EXSTYLE,
                 ex_style | WS_EX_NOREDIRECTIONBITMAP as i32,
             );
-            let noredir = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP as i32 != 0;
+            let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            let noredir = (style & WS_EX_NOREDIRECTIONBITMAP as i32) != 0;
             let dark_mode = u32::from(dark);
             let dark_hr = DwmSetWindowAttribute(
                 hwnd,
@@ -1154,8 +1217,38 @@ mod windows {
             let alpha =
                 std::env::var("RUSTFILES_ALPHA_SURFACE").unwrap_or_else(|_| "unknown".into());
             format!(
-                "mica: hr={hr:#010x} alpha_surface={alpha} blur={blur_hr:#010x} dark={dark_hr:#010x} extend={extend_hr:#010x} noredir={noredir}"
+                "mica: hr={hr:#010x} alpha_surface={alpha} presentation=DxgiFromVisual blur={blur_hr:#010x} dark={dark_hr:#010x} extend={extend_hr:#010x} noredir={noredir}"
             )
+        }
+    }
+
+    pub fn trim_working_set() {
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let _ = K32EmptyWorkingSet(GetCurrentProcess());
+        }
+    }
+
+    pub fn memory_counters() -> (u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+                ..std::mem::zeroed()
+            };
+            if GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut _,
+                counters.cb,
+            ) == 0
+            {
+                return (0, 0);
+            }
+            (counters.WorkingSetSize as u64, counters.PrivateUsage as u64)
         }
     }
 

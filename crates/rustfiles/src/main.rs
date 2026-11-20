@@ -1,5 +1,8 @@
 //! RustFiles — a cross-platform file manager with an Everything-style index.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
 mod controls;
 mod i18n;
@@ -7,6 +10,7 @@ mod icons;
 mod layout;
 mod nav;
 mod platform;
+mod qa;
 mod theme;
 mod ui;
 mod worker;
@@ -32,6 +36,9 @@ fn main() -> eframe::Result {
     }
     if let Some(path) = take_option(&args, "--perf-report") {
         std::env::set_var("RUSTFILES_PERF", path);
+    }
+    if let Some(path) = take_option(&args, "--qa-script") {
+        std::env::set_var("RUSTFILES_QA", path);
     }
     if let Some(path) = positional(&args) {
         std::env::set_var("RUSTFILES_OPEN", path);
@@ -71,6 +78,7 @@ fn main() -> eframe::Result {
         } else {
             eframe::Renderer::Glow
         },
+        system_font_fallback: false,
         ..Default::default()
     };
     if use_wgpu {
@@ -78,8 +86,19 @@ fn main() -> eframe::Result {
             options.wgpu_options.wgpu_setup
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+            // HWND flip-model swapchains only advertise opaque alpha. DirectComposition
+            // is the path that supports CompositeAlphaMode::PreMultiplied.
+            create
+                .instance_descriptor
+                .backend_options
+                .dx12
+                .presentation_system = eframe::wgpu::Dx12SwapchainKind::DxgiFromVisual;
         }
-        std::env::set_var("RUSTFILES_ALPHA_SURFACE", "wgpu-dx12-premultiplied");
+        std::env::set_var(
+            "RUSTFILES_ALPHA_SURFACE",
+            "wgpu:DxgiFromVisual:premultiplied",
+        );
+        platform::arm_noredir_hook();
     } else {
         std::env::set_var("RUSTFILES_ALPHA_SURFACE", "glow");
     }
@@ -93,6 +112,10 @@ fn main() -> eframe::Result {
 impl eframe::App for app::RustFilesApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         apply_mica(self, frame, ui.ctx());
+        if let Some(mut player) = self.qa.take() {
+            player.tick(self, ui.ctx());
+            self.qa = Some(player);
+        }
         if let Some(scale) = platform::window_scale() {
             let native = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
             let current = ui.ctx().pixels_per_point();
@@ -182,7 +205,7 @@ fn positional(args: &[String]) -> Option<&String> {
             skip_value = false;
             continue;
         }
-        if arg == "--perf-report" {
+        if arg == "--perf-report" || arg == "--qa-script" {
             skip_value = true;
             continue;
         }

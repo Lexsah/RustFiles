@@ -68,7 +68,8 @@ impl Index {
         let next = self
             .entries
             .iter()
-            .map(|entry| entry.file_ref)
+            .enumerate()
+            .map(|(index, _)| self.file_ref_at(index as u32))
             .max()
             .unwrap_or(0)
             .saturating_add(1);
@@ -94,9 +95,9 @@ impl Index {
             write_u32(&mut out, parent);
             write_u16(&mut out, entry.volume);
             write_u16(&mut out, entry.flags & !TOMBSTONE);
-            write_u64(&mut out, entry.file_ref);
-            write_u64(&mut out, entry.size);
-            write_u64(&mut out, entry.modified);
+            write_u64(&mut out, self.file_ref_at(index as u32));
+            write_u64(&mut out, self.size_at(index));
+            write_u64(&mut out, u64::from(entry.modified));
             write_str(&mut out, self.name_of(index as u32));
         }
         out
@@ -156,6 +157,10 @@ impl Index {
         self.entries.push(EntryAccess::entry(
             parent, volume, flags, file_ref, name_start, name_len, size, modified,
         ));
+        self.file_refs.push(file_ref);
+        if size > u64::from(u32::MAX) {
+            self.big_sizes.insert(self.entries.len() as u32 - 1, size);
+        }
     }
 }
 
@@ -174,15 +179,18 @@ impl EntryAccess {
         size: u64,
         modified: u64,
     ) -> super::index::Entry {
+        let _ = file_ref;
         super::index::Entry {
             parent,
+            name_start,
+            first_child: super::NO_PARENT,
+            next_sibling: super::NO_PARENT,
             volume,
             flags,
-            file_ref,
-            name_start,
             name_len,
-            size,
-            modified,
+            _pad: 0,
+            size_lo: size.min(u64::from(u32::MAX)) as u32,
+            modified: modified.min(u64::from(u32::MAX)) as u32,
         }
     }
 }
