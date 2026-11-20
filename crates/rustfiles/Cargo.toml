@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 rustfiles-core = { path = "../rustfiles-core" }
-eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
 egui = "=0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +36,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Ioctl",
     "Win32_UI_Controls",

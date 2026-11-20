@@ -174,7 +174,7 @@ pub fn init_com() {
 
 /// Extend the window frame and ask Windows 11 for Mica (`DWMSBT_MAINWINDOW`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
+pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
     #[cfg(windows)]
     {
         windows::enable_window_backdrop(hwnd, dark)
@@ -182,8 +182,44 @@ pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
     #[cfg(not(windows))]
     {
         let _ = (hwnd, dark);
-        false
+        "mica: hr=n/a alpha_surface=glow".to_string()
     }
+}
+
+/// Overwrite `%TEMP%/rustfiles-mica.log` and echo the line. The GUI has no console.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn write_diag(line: &str) {
+    eprintln!("{line}");
+    let path = std::env::temp_dir().join("rustfiles-mica.log");
+    let _ = std::fs::write(path, format!("{line}\n"));
+}
+
+pub fn working_set_bytes() -> u64 {
+    #[cfg(windows)]
+    {
+        windows::working_set_bytes()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_working_set_bytes()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_working_set_bytes() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let pages: u64 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    pages.saturating_mul(4096)
 }
 
 /// Windows accent from `DwmGetColorizationColor` (0xAARRGGBB). Linux has none.
@@ -1034,37 +1070,59 @@ mod windows {
     /// system backdrop, which is why the window stayed flat `#1c1c1c`.
     /// winit's transparent flag also enables blur-behind, and that conflicts
     /// with `DWMWA_SYSTEMBACKDROP_TYPE`, so blur-behind is turned off first.
-    pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> bool {
-        use windows_sys::Win32::Foundation::HWND;
+    pub fn enable_window_backdrop(hwnd: isize, dark: bool) -> String {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
         use windows_sys::Win32::Graphics::Dwm::{
             DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
             DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
             DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
         };
         use windows_sys::Win32::UI::Controls::MARGINS;
+        use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
-            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_NOREDIRECTIONBITMAP,
+            GetWindowLongW, SetClassLongPtrW, SetWindowLongW, SetWindowPos, GCLP_HBRBACKGROUND,
+            GWL_EXSTYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            WS_EX_NOREDIRECTIONBITMAP,
         };
         let hwnd = hwnd as HWND;
         unsafe {
+            // A class background brush paints an opaque #1c1c1c before we draw.
+            let _ = SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, 0);
+            static HOOKED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !HOOKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                unsafe extern "system" fn proc(
+                    hwnd: HWND,
+                    msg: u32,
+                    wparam: WPARAM,
+                    lparam: LPARAM,
+                    _id: usize,
+                    _data: usize,
+                ) -> LRESULT {
+                    // WM_ERASEBKGND
+                    if msg == 0x0014 {
+                        return 1;
+                    }
+                    DefSubclassProc(hwnd, msg, wparam, lparam)
+                }
+                let _ = SetWindowSubclass(hwnd, Some(proc), 1, 0);
+            }
             let blur = DWM_BLURBEHIND {
                 dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
                 fEnable: false.into(),
                 hRgnBlur: std::ptr::null_mut(),
                 fTransitionOnMaximized: false.into(),
             };
-            let _ = DwmEnableBlurBehindWindow(hwnd, &blur);
-            // Compose the GL framebuffer's alpha directly so a transparent clear
-            // shows the Mica material instead of an opaque redirection surface.
+            let blur_hr = DwmEnableBlurBehindWindow(hwnd, &blur);
             let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
             SetWindowLongW(
                 hwnd,
                 GWL_EXSTYLE,
                 ex_style | WS_EX_NOREDIRECTIONBITMAP as i32,
             );
+            let noredir = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP as i32 != 0;
             let dark_mode = u32::from(dark);
-            let _ = DwmSetWindowAttribute(
+            let dark_hr = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
                 &dark_mode as *const u32 as *const _,
@@ -1076,7 +1134,7 @@ mod windows {
                 cyTopHeight: -1,
                 cyBottomHeight: -1,
             };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            let extend_hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
             let backdrop = DWMSBT_MAINWINDOW;
             let hr = DwmSetWindowAttribute(
                 hwnd,
@@ -1093,7 +1151,28 @@ mod windows {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
             );
-            hr >= 0
+            let alpha =
+                std::env::var("RUSTFILES_ALPHA_SURFACE").unwrap_or_else(|_| "unknown".into());
+            format!(
+                "mica: hr={hr:#010x} alpha_surface={alpha} blur={blur_hr:#010x} dark={dark_hr:#010x} extend={extend_hr:#010x} noredir={noredir}"
+            )
+        }
+    }
+
+    pub fn working_set_bytes() -> u64 {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        unsafe {
+            let mut counters = PROCESS_MEMORY_COUNTERS {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..std::mem::zeroed()
+            };
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) == 0 {
+                return 0;
+            }
+            counters.WorkingSetSize as u64
         }
     }
 

@@ -14,6 +14,9 @@ use crate::nav::{self, Action};
 use crate::platform::{self, DetectedVolume, Places};
 use crate::worker::{self, Command, Event, MapCell, Progress};
 
+const ICON_CACHE: usize = 48;
+const THUMB_CACHE: usize = 16;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Files,
@@ -150,6 +153,7 @@ pub struct RustFilesApp {
     icon_order: VecDeque<PathBuf>,
     pub icon_tx: Sender<worker::IconJob>,
     pub mica_applied: bool,
+    pub mica_log: String,
     pub system_accent: Option<egui::Color32>,
     #[cfg_attr(not(windows), allow(dead_code))]
     pub mica_armed: bool,
@@ -187,12 +191,21 @@ pub struct RustFilesApp {
 impl RustFilesApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = load_config();
+        #[cfg(windows)]
+        if let Some(state) = cc.wgpu_render_state.as_ref() {
+            std::env::set_var(
+                "RUSTFILES_ALPHA_SURFACE",
+                format!("wgpu:{:?}", state.target_format),
+            );
+        }
         install_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.dark);
         let (commands, command_rx) = std::sync::mpsc::channel();
         let (event_tx, events) = std::sync::mpsc::channel();
         let progress = Arc::new(Progress {
             files: std::sync::atomic::AtomicU64::new(0),
+            index_entries: std::sync::atomic::AtomicU64::new(0),
+            index_bytes: std::sync::atomic::AtomicU64::new(0),
             status: std::sync::Mutex::new("Starting".into()),
         });
         let icon_tx = worker::spawn(
@@ -278,6 +291,7 @@ impl RustFilesApp {
             icon_order: VecDeque::new(),
             icon_tx,
             mica_applied: false,
+            mica_log: String::new(),
             system_accent: platform::system_accent()
                 .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
             mica_armed: false,
@@ -397,6 +411,28 @@ impl RustFilesApp {
             let delta = ms.saturating_sub(previous);
             let percent = delta as f64 / elapsed_ms * 100.0;
             lines.push_str(&format!("  {name} {delta}ms {percent:.1}%\n"));
+        }
+        let (icon_n, icon_bytes) = texture_bytes(&self.icons_tex);
+        let (thumb_n, thumb_bytes) = texture_bytes(&self.thumbs);
+        let rss = platform::working_set_bytes();
+        let entries = self
+            .progress
+            .index_entries
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let index_bytes = self
+            .progress
+            .index_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        lines.push_str(&format!(
+            "heap rss_mb={} index_entries={entries} index_mb={} icons={icon_n} icon_mb={} thumbs={thumb_n} thumb_mb={}\n",
+            rss / (1024 * 1024),
+            index_bytes / (1024 * 1024),
+            icon_bytes / (1024 * 1024),
+            thumb_bytes / (1024 * 1024),
+        ));
+        if !self.mica_log.is_empty() {
+            lines.push_str(&self.mica_log);
+            lines.push('\n');
         }
         self.perf_cpu = now;
         self.perf_last = Instant::now();
@@ -526,7 +562,7 @@ impl RustFilesApp {
                 );
                 self.thumb_order.retain(|have| have != &path);
                 self.thumb_order.push_back(path);
-                while self.thumb_order.len() > 256 {
+                while self.thumb_order.len() > THUMB_CACHE {
                     if let Some(old) = self.thumb_order.pop_front() {
                         self.thumbs.remove(&old);
                         self.thumb_asked.remove(&old);
@@ -561,7 +597,7 @@ impl RustFilesApp {
                     self.icon_px.insert(path.clone(), px);
                     self.icon_order.retain(|have| have != &path);
                     self.icon_order.push_back(path);
-                    while self.icon_order.len() > 256 {
+                    while self.icon_order.len() > ICON_CACHE {
                         if let Some(old) = self.icon_order.pop_front() {
                             self.icons_tex.remove(&old);
                             self.icon_px.remove(&old);
@@ -1116,6 +1152,7 @@ impl RustFilesApp {
         if path.as_os_str().is_empty() {
             return;
         }
+        let px = px.clamp(16, 48);
         let have = self.icon_px.get(path).copied().unwrap_or(0);
         if have >= px || !self.icon_asked.insert((path.to_path_buf(), px)) {
             return;
@@ -1297,6 +1334,15 @@ pub fn apply_theme(ctx: &Context, dark: bool) {
                 .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
         });
     }
+}
+
+fn texture_bytes(map: &HashMap<PathBuf, egui::TextureHandle>) -> (usize, u64) {
+    let mut bytes = 0u64;
+    for texture in map.values() {
+        let [width, height] = texture.size();
+        bytes = bytes.saturating_add((width as u64).saturating_mul(height as u64) * 4);
+    }
+    (map.len(), bytes)
 }
 
 fn aggregate_cpu(samples: &[(String, u64)]) -> Vec<(String, u64)> {

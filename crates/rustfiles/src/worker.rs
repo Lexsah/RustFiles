@@ -144,7 +144,18 @@ pub struct IconJob {
 
 pub struct Progress {
     pub files: AtomicU64,
+    pub index_entries: AtomicU64,
+    pub index_bytes: AtomicU64,
     pub status: Mutex<String>,
+}
+
+fn publish_index(progress: &Progress, index: &Index) {
+    progress
+        .index_entries
+        .store(index.entry_count() as u64, Ordering::Relaxed);
+    progress
+        .index_bytes
+        .store(index.resident_bytes() as u64, Ordering::Relaxed);
 }
 
 pub fn spawn(
@@ -239,6 +250,7 @@ fn worker_loop(
                     .join()
                     .unwrap_or_else(|_| IndexBuilder::new().finish());
                 let files = built.entry_count() as u64;
+                publish_index(&progress, &built);
                 save_index(Some(&built));
                 index = Some(built);
                 arm_watches(&mut watcher, &volumes, &mut watch_failed, &progress);
@@ -408,6 +420,7 @@ fn boot(
     let mut needs_scan = true;
     if let Ok(loaded) = Index::load(&path) {
         set_status(progress, "Loaded the saved index");
+        publish_index(progress, &loaded);
         *index = Some(loaded);
         let _ = events.send(Event::IndexReady {
             files: index.as_ref().map(Index::entry_count).unwrap_or(0) as u64,
@@ -415,9 +428,14 @@ fn boot(
         });
         if let Some(current) = index.as_mut() {
             if catch_up(current, progress) {
-                save_index(index.as_ref());
                 needs_scan = false;
             }
+        }
+        if let Some(current) = index.as_ref() {
+            if !needs_scan {
+                save_index(Some(current));
+            }
+            publish_index(progress, current);
         }
     }
     if needs_scan {
