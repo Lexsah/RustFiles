@@ -973,7 +973,30 @@ mod windows {
     }
 
     pub fn cloud_roots() -> Vec<super::ShellPlace> {
-        reg_sync_roots()
+        let mut places = reg_sync_roots();
+        let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+        let Some(home) = home else {
+            return places;
+        };
+        for (name, folder) in [
+            ("Nextcloud", "Nextcloud"),
+            ("Proton Drive", "Proton Drive"),
+            ("Dropbox", "Dropbox"),
+            ("Google Drive", "Google Drive"),
+            ("iCloud Drive", "iCloudDrive"),
+            ("OneDrive", "OneDrive"),
+            ("Box", "Box"),
+            ("MEGA", "MEGA"),
+        ] {
+            let path = home.join(folder);
+            if path.is_dir() && !places.iter().any(|place| place.path == path) {
+                places.push(super::ShellPlace {
+                    name: name.to_string(),
+                    path,
+                });
+            }
+        }
+        places
     }
 
     pub fn wsl_distros() -> Vec<super::ShellPlace> {
