@@ -176,7 +176,7 @@ pub fn catalog() -> &'static [Control] {
         Control {
             surface: "Sidebar",
             name: "Pin",
-            behavior: "Pins the current folder",
+            behavior: "Pins the folder from its context menu or the row hover button",
         },
         Control {
             surface: "Sidebar",
