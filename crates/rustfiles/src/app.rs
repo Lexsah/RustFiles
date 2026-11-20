@@ -67,7 +67,7 @@ impl Tab {
             hist_pos: 0,
             path,
             home,
-            view: ViewMode::Tiles,
+            view: ViewMode::Grid,
             sort: SortColumn::Name,
             ascending: true,
             selected: Vec::new(),
@@ -114,6 +114,9 @@ pub struct RustFilesApp {
     pub places: Places,
     pub volumes: Vec<DetectedVolume>,
     pub favorites: Vec<PathBuf>,
+    pub quick_pins: Vec<crate::platform::ShellPlace>,
+    pub cloud_roots: Vec<crate::platform::ShellPlace>,
+    pub wsl_distros: Vec<crate::platform::ShellPlace>,
     pub dark: bool,
     pub show_hidden: bool,
     pub show_preview: bool,
@@ -256,6 +259,9 @@ impl RustFilesApp {
             places,
             volumes: Vec::new(),
             favorites,
+            quick_pins: crate::platform::quick_pins(),
+            cloud_roots: crate::platform::cloud_roots(),
+            wsl_distros: crate::platform::wsl_distros(),
             dark: config.dark,
             show_hidden: config.show_hidden,
             show_preview: config.show_preview,
@@ -1175,7 +1181,7 @@ impl RustFilesApp {
         if path.as_os_str().is_empty() {
             return;
         }
-        let px = px.clamp(16, 48);
+        let px = px.clamp(16, 256);
         let have = self.icon_px.get(path).copied().unwrap_or(0);
         if have >= px || !self.icon_asked.insert((path.to_path_buf(), px)) {
             return;

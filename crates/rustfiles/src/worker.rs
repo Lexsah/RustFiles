@@ -853,7 +853,7 @@ fn save_index(index: Option<&Index>) {
     if let Some(index) = index {
         let path = platform::index_path();
         if let Err(err) = index.save(&path) {
-            eprintln!("failed to save index: {err}");
+            crate::platform::write_diag(&format!("failed to save index: {err}"));
         }
     }
 }
